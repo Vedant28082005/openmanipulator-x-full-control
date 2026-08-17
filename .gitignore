@@ -1,3 +1,9 @@
 opmx/
 __pycache__/
 *.pyc
+
+# MuJoCo writes this on any simulation warning/error - noise, not source
+MUJOCO_LOG.TXT
+
+# Teach-by-demonstration recordings are user data, not source
+recordings/

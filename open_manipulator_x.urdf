@@ -6,10 +6,10 @@
 <robot name="open_manipulator_x">
 
   <mujoco>
-    <compiler meshdir="meshes"/>
+    <compiler meshdir="."/>
     <asset>
-      <texture type="skybox" builtin="flat" rgb1="0 0 0" rgb2="0 0 0" width="100" height="100"/>
-    </asset>  
+      <texture type="skybox" builtin="flat" rgb1="1 1 1" rgb2="1 1 1" width="100" height="100"/>
+    </asset>
   </mujoco>
 
   <link name="world"/>
