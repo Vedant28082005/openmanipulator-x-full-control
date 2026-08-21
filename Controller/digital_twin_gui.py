@@ -27,7 +27,9 @@ import numpy as np
 import pygame
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import web_app
 from dynamixel_sdk import (PortHandler, PacketHandler, GroupSyncWrite, GroupSyncRead,
                            DXL_LOBYTE, DXL_HIBYTE, DXL_LOWORD, DXL_HIWORD)
 
@@ -152,6 +154,13 @@ GRIPPER_CALIB_MARGIN = 15       # back off this many ticks from each hard stop
 
 # Record / playback (teach by demonstration).
 RECORD_MIN_DELTA = 1e-4     # skip frames where nothing meaningfully moved
+HW_FEEDBACK_RATE = 30.0     # Hz for the normal serial feedback/goal-write loop
+RECORD_RATE = 60.0          # Hz while recording - 2x, for finer-grained capture.
+                            # Recording samples the arm's encoders on that same
+                            # loop, so the loop rate IS the capture rate. It's
+                            # affordable because recording skips the goal-write
+                            # half of the cycle (the arm drives the twin, not the
+                            # reverse), so the extra cycles cost only sync-reads.
 PLAYBACK_APPROACH_TIME = 2.5  # seconds to ease from the current pose into frame 0
 PLAYBACK_APPROACH_RATE = 50.0 # Hz for that easing ramp
 RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "recordings")
@@ -162,6 +171,25 @@ RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__
 HOME_POSITION = np.array([1.589, 0.330, -0.107, 1.663, 0.0066, 0.0066])
 HOME_APPROACH_TIME = 2.5    # seconds to ease into home, same feel as playback's approach ramp
 HOME_APPROACH_RATE = 50.0   # Hz for that easing ramp
+
+# Runtime options, set from the command line in __main__. Defaults keep the
+# desktop behaviour exactly as it was.
+class Options:
+    viewer = True       # show the MuJoCo 3D window
+    panel = True        # show the Tk control panel
+    web = True          # serve the mobile web panel
+    port = None         # None -> web_app.WEB_PORT
+    bind = None         # None -> web_app.WEB_BIND
+
+
+OPTS = Options()
+
+
+# Control-panel window sizing. The panel is taller than a 1080p screen once
+# every section is expanded, so it scrolls rather than clipping.
+SCREEN_MARGIN = 80          # leave room for the taskbar/titlebar
+SCROLLBAR_ALLOWANCE = 20    # width the vertical scrollbar takes from content
+MIN_WINDOW_HEIGHT = 400     # still usable on a very short display
 
 XML_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "open_manipulator_x.xml")
 
@@ -637,6 +665,35 @@ def decode_hw_error(err_byte: int) -> str:
     return "+".join(names) if names else f"0x{err_byte:02x}"
 
 
+class _NullViewer:
+    """Stand-in for the MuJoCo passive viewer when running without a 3D window.
+
+    A Raspberry Pi has no GPU driver MuJoCo can use well - it falls back to
+    software rendering, which burns most of a core to draw a window nobody is
+    looking at. The sim loop is written against the viewer's interface, so
+    this satisfies it without opening anything."""
+
+    class _Perturb:
+        select = -1     # never matches workspace_body_id, so picking is inert
+        active = 0
+
+    def __init__(self, stop_event):
+        self._stop = stop_event
+        self.perturb = self._Perturb()
+
+    def is_running(self):
+        return not self._stop.is_set()
+
+    def sync(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class DigitalTwinApp:
     def __init__(self, root):
         self.root = root
@@ -703,8 +760,19 @@ class DigitalTwinApp:
         self._poll_ee_readout()
         self._poll_feedback_readout()
         self._poll_gamepad_readout()
+        self._poll_web_readout()
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Mobile control panel. Started last so it can never delay the
+        # desktop UI coming up, and failure to bind is non-fatal - the
+        # desktop app stays fully usable without it.
+        self.web = None
+        if OPTS.web:
+            self.web = web_app.start(
+                self, sys.modules[__name__],
+                port=OPTS.port if OPTS.port is not None else web_app.WEB_PORT,
+                bind=OPTS.bind if OPTS.bind is not None else web_app.WEB_BIND)
 
     def _bind_keyboard(self):
         self.root.bind_all("<KeyPress>", self._on_key_press)
@@ -726,10 +794,75 @@ class DigitalTwinApp:
         if not self.stop_event.is_set():
             self.root.after(50, self._poll_keyboard_refresh)
 
+    def _build_scroll_container(self):
+        """Put the whole panel on a scrollable canvas and size the window to
+        the screen.
+
+        The panel's natural height is ~1000 px and grows with every section;
+        on a shorter display the bottom sections (Gamepad Teleop, Position
+        Gain Tuning) were simply cut off with no way to reach them, because
+        a bare Tk window clips its children rather than scrolling them."""
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        vbar = ttk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.container = ttk.Frame(self.canvas)
+        self._container_win = self.canvas.create_window(
+            (0, 0), window=self.container, anchor="nw")
+        self.container.columnconfigure(0, weight=1)
+
+        def _on_content_resize(_event):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+        def _on_canvas_resize(event):
+            # Keep the inner frame as wide as the viewport so the sections'
+            # sticky="ew" still fills the width instead of hugging content.
+            self.canvas.itemconfigure(self._container_win, width=event.width)
+
+        self.container.bind("<Configure>", _on_content_resize)
+        self.canvas.bind("<Configure>", _on_canvas_resize)
+        self._bind_mousewheel()
+        self.root.after_idle(self._fit_window_to_screen)
+
+    def _bind_mousewheel(self):
+        """Wheel scrolling, X11 (Button-4/5) and Windows/macOS (MouseWheel)."""
+        def _wheel(event):
+            if event.num == 4:
+                delta = -1
+            elif event.num == 5:
+                delta = 1
+            else:
+                delta = -1 if event.delta > 0 else 1
+            self.canvas.yview_scroll(delta, "units")
+
+        for seq in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
+            self.root.bind_all(seq, _wheel)
+
+    def _fit_window_to_screen(self):
+        """Open at the panel's natural size, but never taller than the screen.
+
+        Called after_idle so the geometry manager has computed the real
+        requested size of the fully-populated panel first."""
+        self.root.update_idletasks()
+        want_w = self.container.winfo_reqwidth() + SCROLLBAR_ALLOWANCE
+        want_h = self.container.winfo_reqheight()
+        max_w = self.root.winfo_screenwidth() - SCREEN_MARGIN
+        max_h = self.root.winfo_screenheight() - SCREEN_MARGIN
+        self.root.geometry(f"{min(want_w, max_w)}x{min(want_h, max_h)}")
+        # Wide enough to not clip the widest row, short enough to still fit a
+        # small screen - the scrollbar covers whatever is left over.
+        self.root.minsize(min(want_w, max_w), MIN_WINDOW_HEIGHT)
+
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
+        self._build_scroll_container()
 
-        sliders = ttk.LabelFrame(self.root, text="Joint Control")
+        sliders = ttk.LabelFrame(self.container, text="Joint Control")
         sliders.grid(row=0, column=0, sticky="ew", **pad)
 
         self.scale_vars = []
@@ -750,7 +883,7 @@ class DigitalTwinApp:
         ttk.Label(sliders, textvariable=self.home_status_var).grid(
             row=len(JOINT_SPECS), column=2, sticky="w", padx=6)
 
-        fb = ttk.LabelFrame(self.root, text="Live Motor Feedback (present position read from the real arm)")
+        fb = ttk.LabelFrame(self.container, text="Live Motor Feedback (present position read from the real arm)")
         fb.grid(row=4, column=0, sticky="ew", **pad)
 
         for col, head in enumerate(("Joint", "Tick", "Value", "Degrees")):
@@ -777,7 +910,7 @@ class DigitalTwinApp:
         ttk.Label(fb, textvariable=self.mirror_note_var, wraplength=560).grid(
             row=len(JOINT_SPECS) + 2, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 4))
 
-        rec = ttk.LabelFrame(self.root, text="Record && Playback (hand-guide the arm, then replay it)")
+        rec = ttk.LabelFrame(self.container, text="Record && Playback (hand-guide the arm, then replay it)")
         rec.grid(row=5, column=0, sticky="ew", **pad)
 
         self.record_btn = ttk.Button(rec, text="● Record", command=self.on_toggle_record, state="disabled")
@@ -797,7 +930,7 @@ class DigitalTwinApp:
         ttk.Label(rec, textvariable=self.record_status_var, wraplength=560).grid(
             row=1, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 6))
 
-        tune = ttk.LabelFrame(self.root, text="Position Gain Tuning (live - fixes joint vibration at rest)")
+        tune = ttk.LabelFrame(self.container, text="Position Gain Tuning (live - fixes joint vibration at rest)")
         tune.grid(row=7, column=0, sticky="ew", **pad)
 
         ttk.Label(tune, text="Joint:").grid(row=0, column=0, sticky="e", padx=(8, 2), pady=6)
@@ -840,7 +973,7 @@ class DigitalTwinApp:
         ttk.Label(tune, textvariable=self.tune_status_var, wraplength=600).grid(
             row=2, column=0, columnspan=12, sticky="w", padx=8, pady=(0, 6))
 
-        gp = ttk.LabelFrame(self.root, text="Gamepad Teleop")
+        gp = ttk.LabelFrame(self.container, text="Gamepad Teleop")
         gp.grid(row=6, column=0, sticky="ew", **pad)
 
         self.gamepad_connect_btn = ttk.Button(gp, text="Connect Gamepad", command=self.on_connect_gamepad)
@@ -862,11 +995,23 @@ class DigitalTwinApp:
         ttk.Label(gp, textvariable=self.gamepad_raw_var, wraplength=560, foreground="#555").grid(
             row=3, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
 
-        kb = ttk.LabelFrame(self.root, text="Keyboard Controls (click the window first to give it focus)")
+        remote = ttk.LabelFrame(self.container, text="Remote Access (mobile web panel)")
+        remote.grid(row=8, column=0, sticky="ew", **pad)
+
+        self.web_url_var = tk.StringVar(value="Web panel starting...")
+        ttk.Label(remote, textvariable=self.web_url_var, wraplength=600,
+                  font=("TkDefaultFont", 10, "bold")).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(6, 2))
+
+        self.web_info_var = tk.StringVar(value="")
+        ttk.Label(remote, textvariable=self.web_info_var, wraplength=600,
+                  foreground="#444").grid(row=1, column=0, sticky="w", padx=8, pady=(0, 6))
+
+        kb = ttk.LabelFrame(self.container, text="Keyboard Controls (click the window first to give it focus)")
         kb.grid(row=2, column=0, sticky="ew", **pad)
         ttk.Label(kb, text=KEYBOARD_HELP).grid(row=0, column=0, sticky="w", padx=6, pady=4)
 
-        hw = ttk.LabelFrame(self.root, text="Hardware (U2D2 /dev/ttyUSB0 @ 1,000,000 bps, protocol 2.0)")
+        hw = ttk.LabelFrame(self.container, text="Hardware (U2D2 /dev/ttyUSB0 @ 1,000,000 bps, protocol 2.0)")
         hw.grid(row=1, column=0, sticky="ew", **pad)
 
         self.connect_btn = ttk.Button(hw, text="Connect", command=self.on_connect)
@@ -891,7 +1036,7 @@ class DigitalTwinApp:
         self.status_var = tk.StringVar(value="Not connected - simulation only")
         ttk.Label(hw, textvariable=self.status_var, wraplength=560).grid(row=1, column=0, columnspan=6, sticky="w", padx=6)
 
-        ik = ttk.LabelFrame(self.root, text="Inverse Kinematics (end-effector target, meters)")
+        ik = ttk.LabelFrame(self.container, text="Inverse Kinematics (end-effector target, meters)")
         ik.grid(row=3, column=0, sticky="ew", **pad)
 
         ttk.Label(ik, text="Tip: the translucent blue sphere in the 3D viewer is the arm's reach - "
@@ -1106,6 +1251,31 @@ class DigitalTwinApp:
         self.connect_btn.config(state="normal")
         self.set_status(f"Disconnected - {DEVICENAME} is free (e.g. for DYNAMIXEL Wizard). "
                         f"Click Connect to resume.")
+
+    def _poll_web_readout(self):
+        """Keep the desktop panel's Remote Access section current.
+
+        Reads the same snapshot the phone polls, so if this section looks
+        wrong the phone is seeing exactly the same wrong thing."""
+        host = {}
+        if getattr(self, "web", None) is not None:
+            with self.web_state_lock:
+                host = (self.web_state or {}).get("host", {})
+        if not host:
+            self.web_url_var.set("Web panel not running (--no-web, or the port was busy)")
+            self.web_info_var.set("")
+        else:
+            auth = "token required" if host["auth"] else "NO AUTH - trusted network only"
+            self.web_url_var.set(f"http://{host['ip']}:{host['port']}/    ({auth})")
+            temp = f"   CPU {host['cpu_c']}C" if host.get("cpu_c") is not None else ""
+            mins, secs = divmod(host["uptime_s"], 60)
+            hours, mins = divmod(mins, 60)
+            self.web_info_var.set(
+                f"host {host['name']}   up {hours}h{mins:02d}m{secs:02d}s{temp}   "
+                f"feedback {host['feedback_hz']:.0f} Hz / record {host['record_hz']:.0f} Hz   "
+                f"viewer {'on' if host['viewer'] else 'off'}")
+        if not self.stop_event.is_set():
+            self.root.after(1000, self._poll_web_readout)
 
     def _poll_feedback_readout(self):
         """Refresh the feedback table from whatever the sim loop last read."""
@@ -1420,6 +1590,11 @@ class DigitalTwinApp:
             filetypes=[("Recording", "*.json")], title="Save recording")
         if not path:
             return
+        self.save_recording_to(path)
+
+    def save_recording_to(self, path):
+        """Serialize the current frames to `path`. Shared by the Tk save
+        dialog and the web API, so both write the identical format."""
         with self.lock:
             payload = {
                 "joints": [spec[0] for spec in JOINT_SPECS],
@@ -1431,6 +1606,7 @@ class DigitalTwinApp:
         with open(path, "w") as f:
             json.dump(payload, f)
         self._set_record_status(f"Saved {len(payload['frames'])} frames to {os.path.basename(path)}")
+        return len(payload["frames"])
 
     def on_load_recording(self):
         if self.playing or self.recording:
@@ -1440,21 +1616,27 @@ class DigitalTwinApp:
             initialdir=RECORDINGS_DIR, filetypes=[("Recording", "*.json")], title="Load recording")
         if not path:
             return
+        self.load_recording_from(path)
+
+    def load_recording_from(self, path):
+        """Load frames from `path`. Shared by the Tk load dialog and the web
+        API. Returns True on success; status text explains any failure."""
         try:
             with open(path) as f:
                 payload = json.load(f)
             frames = [(float(t), np.array(p, dtype=float)) for t, p in payload["frames"]]
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self._set_record_status(f"Could not load recording: {exc}")
-            return
+            return False
         if not frames:
             self._set_record_status("That file has no frames.")
-            return
+            return False
         with self.lock:
             self.frames = frames
         self._refresh_playback_buttons()
         self._set_record_status(
             f"Loaded {len(frames)} frames ({frames[-1][0]:.1f} s) from {os.path.basename(path)}")
+        return True
 
     def on_diagnose_gripper(self):
         threading.Thread(target=lambda: self.set_status(self.hw.diagnose_gripper()), daemon=True).start()
@@ -1632,7 +1814,10 @@ class DigitalTwinApp:
         pick_period = 1.0 / 15.0  # workspace-sphere pick poll at 15 Hz
         last_t = time.perf_counter()
 
-        with mujoco.viewer.launch_passive(self.model, self.data, key_callback=self._on_glfw_key) as viewer:
+        viewer_ctx = (mujoco.viewer.launch_passive(
+                          self.model, self.data, key_callback=self._on_glfw_key)
+                      if OPTS.viewer else _NullViewer(self.stop_event))
+        with viewer_ctx as viewer:
             while viewer.is_running() and not self.stop_event.is_set():
                 # Integrate jog motion against the WALL CLOCK rather than the
                 # sim timestep: the loop assumed 2.0 ms per iteration while
@@ -1742,7 +1927,8 @@ class DigitalTwinApp:
         from ~2 ms to 5-8 ms), which is felt as stuttering while jogging.
         Out here a slow bus transaction delays only the next hardware
         update, never the motion integration or the render."""
-        hw_period = 1.0 / 30.0
+        hw_period = 1.0 / HW_FEEDBACK_RATE
+        record_period = 1.0 / RECORD_RATE
         err_period = 1.0
         last_err = time.perf_counter()
 
@@ -1797,18 +1983,58 @@ class DigitalTwinApp:
 
             # Pace by how long the cycle actually took, so bus latency
             # doesn't compound into an ever-slower update rate.
-            remaining = hw_period - (time.perf_counter() - cycle_start)
+            period = record_period if self.recording else hw_period
+            remaining = period - (time.perf_counter() - cycle_start)
             time.sleep(remaining if remaining > 0 else 0.001)
 
     def on_close(self):
         self.stop_event.set()
+        if getattr(self, "web", None) is not None:
+            self.web.shutdown()
         self.hw.disconnect()
         pygame.joystick.quit()
         pygame.quit()
         self.root.destroy()
 
 
+def _parse_args(argv):
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="digital_twin_gui.py",
+        description="OpenManipulator-X digital twin: MuJoCo sim, desktop panel "
+                    "and mobile web control, all driving one arm.")
+    ap.add_argument("--no-viewer", action="store_true",
+                    help="don't open the MuJoCo 3D window (saves a lot of CPU "
+                         "on a Raspberry Pi, which has no usable GL driver for it)")
+    ap.add_argument("--no-panel", action="store_true",
+                    help="hide the Tk control panel window; the app still runs "
+                         "and the web panel still works")
+    ap.add_argument("--headless", action="store_true",
+                    help="shorthand for --no-viewer --no-panel: web control only. "
+                         "Still needs an X display for Tk's event loop - run it "
+                         "under Xvfb (the Pi installer sets this up).")
+    ap.add_argument("--no-web", action="store_true",
+                    help="don't serve the mobile web panel")
+    ap.add_argument("--port", type=int, default=None, help="web panel port (default 8080)")
+    ap.add_argument("--bind", default=None,
+                    help="web panel bind address (default 0.0.0.0; use 127.0.0.1 "
+                         "to accept only local/tunnelled connections)")
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
+    args = _parse_args(sys.argv[1:])
+    OPTS.viewer = not (args.no_viewer or args.headless)
+    OPTS.panel = not (args.no_panel or args.headless)
+    OPTS.web = not args.no_web
+    OPTS.port = args.port
+    OPTS.bind = args.bind
+
     root = tk.Tk()
+    if not OPTS.panel:
+        # Withdrawn, not destroyed: every status update and cross-thread call
+        # in this app is scheduled through root.after(), so the Tk event loop
+        # has to keep running even when nobody is looking at the window.
+        root.withdraw()
     app = DigitalTwinApp(root)
     root.mainloop()

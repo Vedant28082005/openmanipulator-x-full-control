@@ -50,6 +50,9 @@ grew into a standalone hardware+simulation control application — see
   - Thread-safe hardware access — all serial I/O is centralized behind a
     single lock, so the continuous feedback/command loop can't corrupt reads
     from concurrent UI actions (Diagnose, Calibrate, etc.)
+- **Mobile web control panel** — every control above, laid out for a phone
+  and served from the app itself on port 8080. Starts automatically with the
+  GUI; see [Mobile web control panel](#mobile-web-control-panel).
 
 ## Demo control flow
 
@@ -121,6 +124,44 @@ pip install -r requirements.txt
    It starts in **simulation-only mode** — no hardware is touched until you
    explicitly click **Connect**.
 
+## Mobile web control panel
+
+The GUI starts an HTTP server on port 8080 as it comes up and prints the
+address:
+
+```
+[web] mobile control panel: http://192.168.1.42:8080/  (also http://localhost:8080/)
+```
+
+Open that address on a phone on the same network. Add it to the home screen
+and it runs full-screen like an app. Everything the desktop panel does is
+there — joint sliders, hold-to-jog pads (joint or Cartesian), IK solve, teach
+record/playback with save/load, live motor feedback, mirror mode, gain tuning,
+gripper diagnose/calibrate, and a permanently visible **E-STOP** in the header.
+
+Both UIs drive the same application state, so they stay in sync: move a
+slider on the phone and the desktop slider moves with it.
+
+Design notes worth knowing:
+
+- **Held jog is watchdogged.** The browser re-asserts a held button every
+  150 ms and the server releases any jog key it stops hearing about within
+  450 ms. Locking the phone, closing the tab, walking out of wifi range or
+  sliding a finger off the button all stop the arm.
+- **E-STOP bypasses the UI queue.** It runs off the Tk thread deliberately,
+  so it can't end up waiting behind a slow redraw or a blocking dialog.
+- **The web panel never touches Tk widgets.** Requests either schedule the
+  same `on_*` handler the desktop button uses, or read a state snapshot the
+  Tk thread republishes every 100 ms. That's why the two UIs can't drift
+  apart in behaviour.
+
+> **⚠ SECURITY — there is no authentication.** Anyone who can reach port 8080
+> can move the arm. That is fine on an isolated lab network and *not* fine on
+> a shared or public one. To restrict it to this machine only, change
+> `WEB_BIND` in `Controller/web_app.py` to `"127.0.0.1"`; to change the port,
+> edit `WEB_PORT` in the same file. If the port is already busy the desktop
+> app still starts normally and just logs that the web panel is unavailable.
+
 ## Usage guide
 
 ### Simulation only (no hardware)
@@ -177,6 +218,24 @@ Recording and playback each take exclusive control of the arm while active —
 mirror mode, Calibrate, manual torque toggling, and the sliders are all
 locked out and restored automatically when you stop.
 
+**Capture rate.** Recording samples the arm's own encoders on the serial
+feedback loop, so that loop's rate *is* the capture rate. It runs at
+`RECORD_RATE` (60 Hz) while recording and `HW_FEEDBACK_RATE` (30 Hz)
+otherwise — recording skips the goal-write half of the cycle, so the extra
+cycles cost only sync-reads. Playback is timestamp-driven and replays at the
+speed it was taught regardless of capture rate; goal writes to the arm still
+go out at 30 Hz.
+
+Hitting a true 60 Hz needs the U2D2's FTDI latency timer lowered from its
+16 ms default, or each read alone eats the entire 16.7 ms budget:
+
+```bash
+echo 'SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTR{latency_timer}="1"' | sudo tee /etc/udev/rules.d/99-dynamixel-latency.rules && sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+This speeds up teleop responsiveness and the normal 30 Hz feedback loop too,
+not just recording.
+
 ### Gripper calibration
 
 The default gripper open/close ticks in `GRIPPER_DEG_CLOSED` /
@@ -207,6 +266,7 @@ open_manipulator_x.xml        Generated MuJoCo model (regenerate with the
                                script above; don't hand-edit)
 Controller/
   digital_twin_gui.py          The main application (this project's core)
+  web_app.py                   Mobile web panel served by the app (stdlib only)
   controller_cntroll.py        Original gamepad-only sim control script
   controller_test.py           Gamepad axis/button test utility
 meshes/, STL/                  Robot visual/collision geometry
