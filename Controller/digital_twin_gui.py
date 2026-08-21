@@ -242,6 +242,7 @@ GAMEPAD_AXIS_RIGHT_X = 3
 GAMEPAD_AXIS_RIGHT_Y = 4
 GAMEPAD_BTN_GRIPPER_CLOSE = 4   # LB
 GAMEPAD_BTN_GRIPPER_OPEN = 5    # RB
+GAMEPAD_BTN_HOME = 3            # Y - go to home position
 GAMEPAD_DEADZONE = 0.15
 GAMEPAD_JOINT_RATE = 1.5      # rad/s at full stick deflection
 GAMEPAD_CARTESIAN_RATE = 0.08 # m/s at full stick deflection
@@ -251,6 +252,7 @@ GAMEPAD_HELP = (
     "Left stick: joint mode -> Base/Shoulder   cartesian mode -> X/Y\n"
     "Right stick: joint mode -> Wrist/Elbow    cartesian mode -> Z (up/down)\n"
     "LB / RB: gripper close/open   -   Proportional to how far you push (analog).\n"
+    "Y: return to home position (same 2.5s eased move as the Home button).\n"
     "Uses the same Cartesian-jog-mode checkbox as the keyboard, above."
 )
 
@@ -713,6 +715,7 @@ class DigitalTwinApp:
         self.gamepad_enabled = False
         self.gamepad_axes_snapshot = []
         self.gamepad_buttons_snapshot = []
+        self.gamepad_home_was_pressed = False
         # Gripper tick endpoints for slider min/max: directly measured in
         # DYNAMIXEL Wizard (closed=125.2deg, open=270.4deg), not calculated.
         # "Calibrate Gripper" can still re-measure and override these.
@@ -1857,6 +1860,24 @@ class DigitalTwinApp:
                     with self.lock:
                         self.gamepad_axes_snapshot = gp_axes
                         self.gamepad_buttons_snapshot = gp_buttons
+
+                # --- Gamepad Y -> Home position ------------------------------
+                # Edge-triggered, so holding Y fires once instead of restarting
+                # the 2.5s ramp every frame. Dispatched through root.after like
+                # every other cross-thread call here, and deliberately OUTSIDE
+                # self.lock: _go_home_worker takes that lock itself, so
+                # triggering while holding it would make the new thread wait on
+                # a lock this loop still owns. on_go_home() applies the same
+                # record/play/homing guard as the Home button.
+                if gp_buttons is None:
+                    self.gamepad_home_was_pressed = False
+                else:
+                    home_pressed = bool(len(gp_buttons) > GAMEPAD_BTN_HOME
+                                        and gp_buttons[GAMEPAD_BTN_HOME])
+                    if (home_pressed and not self.gamepad_home_was_pressed
+                            and self.gamepad_enabled):
+                        self.root.after(0, self.on_go_home)
+                    self.gamepad_home_was_pressed = home_pressed
 
                 with self.lock:
                     jog_allowed = not self.mirror_mode and not self.recording and not self.playing and not self.homing
