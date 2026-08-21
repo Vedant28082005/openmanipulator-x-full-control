@@ -73,8 +73,18 @@ fi
 # The FTDI default latency timer is 16 ms, which alone eats the entire budget
 # for a 60 Hz loop. 1 ms takes a sync-read from ~16 ms to low single digits.
 say "Installing FTDI low-latency udev rule"
-echo 'SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTR{latency_timer}="1"' \
-    | sudo tee /etc/udev/rules.d/99-dynamixel-latency.rules > /dev/null
+#
+# The second rule fixes device ownership. On Raspberry Pi OS the ttyUSB node is
+# created root:plugdev, and the only thing granting the service user access is
+# a logind "uaccess" ACL that exists because this image happens to autologin on
+# seat0. The systemd unit asks for SupplementaryGroups=dialout, which matches
+# nothing when the node's group is plugdev - so access would silently depend on
+# autologin staying enabled rather than on the group the unit declares. Setting
+# the group explicitly makes the unit's stated mechanism the real one.
+sudo tee /etc/udev/rules.d/99-dynamixel-latency.rules > /dev/null <<'RULES'
+SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTR{latency_timer}="1"
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb-serial", DRIVERS=="ftdi_sio", GROUP="dialout", MODE="0660"
+RULES
 sudo udevadm control --reload-rules
 sudo udevadm trigger || true
 for dev in /sys/bus/usb-serial/devices/ttyUSB*/latency_timer; do
