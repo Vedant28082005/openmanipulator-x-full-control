@@ -1,0 +1,51 @@
+# OpenManipulator-X teleop service.
+#
+# Installed to /etc/systemd/system/omx.service by deploy/install_rpi.sh.
+# Runs the control stack headless under Xvfb: no monitor required, so the Pi
+# can live in a bag with only power and the U2D2 attached.
+#
+# Why Xvfb rather than truly headless: every cross-thread call in the app is
+# scheduled through Tk's event loop, so Tk has to exist even when nothing is
+# displayed. Xvfb costs a few MB and removes the whole class of "works on the
+# desk, dies without a monitor" failures.
+
+[Unit]
+Description=OpenManipulator-X teleop (web control panel + arm driver)
+Documentation=https://github.com/Vedant28082005/openmanipulator-x-full-control
+After=network-online.target
+Wants=network-online.target
+
+# These belong in [Unit], not [Service] - systemd silently ignores them in
+# [Service] and you get an unguarded crash-loop. The arm is only safe if a
+# repeatedly-failing service stops trying to re-energise it.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/openmanipulator-x-full-control
+EnvironmentFile=/etc/omx.env
+
+# xvfb-run -a picks a free display number, so a leftover lock from an unclean
+# shutdown can't wedge the service on restart.
+ExecStart=/usr/bin/xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+    /home/%i/openmanipulator-x-full-control/opmx/bin/python \
+    /home/%i/openmanipulator-x-full-control/Controller/digital_twin_gui.py $OMX_ARGS
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=omx
+
+# The service needs the serial port and nothing else privileged.
+SupplementaryGroups=dialout
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
