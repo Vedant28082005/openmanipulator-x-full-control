@@ -29,9 +29,17 @@ say "Installing system packages"
 sudo apt-get update -qq
 # python3-tk: the control panel. xvfb: lets it run with no monitor attached.
 # libgl1/libglib2.0-0: MuJoCo's shared-library deps even when not rendering.
+# Debian 13 (trixie) renamed libglib2.0-0 to libglib2.0-0t64 in the 64-bit
+# time_t transition; on Bookworm only the old name exists. Pick whichever the
+# running release actually offers, so this works on both.
+GLIB_PKG=libglib2.0-0
+if [[ -z "$(apt-cache policy libglib2.0-0 2>/dev/null | awk '/Candidate:/{print $2}' | grep -v '(none)')" ]]; then
+    GLIB_PKG=libglib2.0-0t64
+fi
+echo "  glib package: $GLIB_PKG"
 sudo apt-get install -y --no-install-recommends \
     python3-venv python3-dev python3-tk xvfb git curl \
-    libgl1 libglib2.0-0
+    libgl1 "$GLIB_PKG"
 
 # ---------------------------------------------------------------- venv
 say "Creating virtualenv at $VENV"
