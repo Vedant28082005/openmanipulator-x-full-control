@@ -642,6 +642,16 @@ nav button.on{color:var(--red)}
 .offline{background:var(--red);color:#fff;text-align:center;padding:7px;
   font-size:12px;font-weight:700;display:none}
 .offline.show{display:block}
+/* Camera. The wrap keeps a 16:9 box whether or not a frame ever arrives, so
+   the page does not jump when the feed appears, disappears, or reconnects. */
+.camwrap{position:relative;width:100%;aspect-ratio:16/9;background:#0b0e12;
+  border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.camwrap img{width:100%;height:100%;object-fit:contain;display:none}
+.camwrap img.live{display:block}
+.camoff{position:absolute;inset:0;display:flex;align-items:center;
+  justify-content:center;text-align:center;padding:12px;color:var(--dim);
+  font-size:13px;line-height:1.5}
+.camwrap img.live + .camoff{display:none}
 """
 
 
@@ -658,6 +668,15 @@ PAGE_BODY = """
 <main>
   <!-- ============ CONTROL ============ -->
   <section class="panel show" id="p-control">
+    <div class="card">
+      <h2>Camera</h2>
+      <div class="camwrap">
+        <img id="cam" alt="Live camera feed">
+        <div class="camoff" id="cam-off">Camera offline</div>
+      </div>
+      <div class="status" id="s-cam"></div>
+      <button class="btn" id="cam-btn">Pause feed</button>
+    </div>
     <div class="card">
       <h2>Joint Control</h2>
       <p class="hint">Drag to set each joint target. The twin always follows; the real arm follows too once torque is on.</p>
@@ -1082,6 +1101,75 @@ setInterval(tick, 200);
 tick();
 """
 
+# Deliberately a SEPARATE <script> tag from PAGE_JS. If anything in here throws
+# or fails to parse, the browser still runs the arm panel script - the camera
+# cannot take the controls down with it. Same isolation rule as the separate
+# service and the separate nginx location.
+CAMERA_JS = """
+(function(){
+  try{
+    var img = document.getElementById('cam');
+    var off = document.getElementById('cam-off');
+    var st  = document.getElementById('s-cam');
+    var btn = document.getElementById('cam-btn');
+    if(!img || !off || !st || !btn) return;
+
+    var paused = false, streaming = false;
+
+    function setOff(msg){
+      streaming = false;
+      img.classList.remove('live');
+      img.removeAttribute('src');
+      off.textContent = msg;
+      st.textContent = '';
+    }
+
+    function startStream(){
+      if(paused || streaming) return;
+      streaming = true;
+      // Cache-buster: without it a reconnect can be served the dead response
+      // from the previous attempt.
+      img.src = '/camera/stream.mjpg?t=' + Date.now();
+      img.classList.add('live');
+    }
+
+    img.onerror = function(){
+      setOff('Camera feed interrupted - retrying...');
+    };
+
+    function poll(){
+      fetch('/camera/status', {cache:'no-store'})
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(d){
+          if(!d || !d.available){
+            setOff(d && d.detail ? ('Camera offline - ' + d.detail)
+                                 : 'Camera offline');
+            return;
+          }
+          st.textContent = d.detail || '';
+          if(!paused) startStream();
+        })
+        .catch(function(){
+          // Camera service down, nginx 502, or no /camera/ route at all.
+          // Purely cosmetic - the arm panel keeps working.
+          setOff('Camera service unavailable');
+        });
+    }
+
+    btn.onclick = function(){
+      paused = !paused;
+      btn.textContent = paused ? 'Resume feed' : 'Pause feed';
+      if(paused){ setOff('Feed paused'); } else { poll(); }
+    };
+
+    setOff('Connecting to camera...');
+    poll();
+    setInterval(poll, 5000);
+  }catch(e){ /* never let the camera break the panel */ }
+})();
+"""
+
+
 PAGE_HTML = ("<!doctype html><html lang=\"en\"><head>"
              "<meta charset=\"utf-8\">"
              "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,"
@@ -1092,4 +1180,5 @@ PAGE_HTML = ("<!doctype html><html lang=\"en\"><head>"
              "<title>OpenManipulator-X</title>"
              "<style>" + PAGE_CSS + "</style></head><body>"
              + PAGE_BODY +
-             "<script>" + PAGE_JS + "</script></body></html>")
+             "<script>" + PAGE_JS + "</script>"
+             "<script>" + CAMERA_JS + "</script></body></html>")

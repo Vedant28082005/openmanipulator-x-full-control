@@ -66,6 +66,23 @@ server {
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy        "no-referrer" always;
 
+    # Live camera feed, served by omx-camera@.service on :8091. Separate
+    # location, separate upstream: if that service is stopped or crashlooping
+    # nginx returns 502 for THIS path only and the arm panel is unaffected.
+    location /camera/ {
+        proxy_pass http://127.0.0.1:8091/;
+        proxy_http_version 1.1;
+        # MJPEG is an endless multipart response - buffering it would add
+        # latency and eventually eat memory, and the default 60s read timeout
+        # would cut the feed.
+        proxy_buffering     off;
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+        # A dead camera must fail fast so the panel can show "offline"
+        # instead of the browser hanging on a connect.
+        proxy_connect_timeout 2s;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;

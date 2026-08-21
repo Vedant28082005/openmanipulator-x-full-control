@@ -1,0 +1,52 @@
+# Live camera feed for the OpenManipulator-X panel (Raspberry Pi AI Camera).
+#
+# Kept as a SEPARATE unit from omx@.service on purpose. The requirement is
+# that a missing or broken camera must not affect the arm, and the only way to
+# guarantee that is a different process: nothing here shares an interpreter,
+# an address space, or a failure domain with the control loop.
+#
+# Note there is no Requires=/BindsTo= in either direction, and omx@.service is
+# untouched. If this unit is stopped, masked, or crashlooping, the arm app does
+# not notice - nginx simply returns 502 for /camera/ and the panel shows the
+# feed as offline.
+
+[Unit]
+Description=OpenManipulator-X camera feed (MJPEG on :8091)
+After=network-online.target
+Wants=network-online.target
+
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/openmanipulator-x-full-control
+
+# System python, NOT the opmx venv: picamera2 and the libcamera bindings are
+# system packages, and rebuilding the venv with --system-site-packages to reach
+# them would pull every system module into the arm app's import namespace.
+ExecStart=/usr/bin/python3 /home/%i/openmanipulator-x-full-control/Controller/camera_server.py
+
+Environment=OMX_CAM_BIND=127.0.0.1
+Environment=OMX_CAM_PORT=8091
+Environment=OMX_CAM_WIDTH=1280
+Environment=OMX_CAM_HEIGHT=720
+Environment=OMX_CAM_FPS=12
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=omx-camera
+
+# Needs the camera nodes (/dev/video*, /dev/media*) and nothing else.
+SupplementaryGroups=video
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
