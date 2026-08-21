@@ -47,6 +47,9 @@ ADDR_MIN_POSITION_LIMIT = 48
 ADDR_MAX_POSITION_LIMIT = 52
 ADDR_TORQUE_ENABLE = 64
 ADDR_HARDWARE_ERROR_STATUS = 70
+ADDR_POSITION_D_GAIN = 80
+ADDR_POSITION_I_GAIN = 82
+ADDR_POSITION_P_GAIN = 84
 ADDR_GOAL_CURRENT = 102
 ADDR_PROFILE_ACCELERATION = 108
 ADDR_PROFILE_VELOCITY = 112
@@ -61,9 +64,53 @@ TICKS_PER_REV = 4096
 CENTER_TICK = 2048
 GRIPPER_ID = 15
 
-# Conservative default motion limits so a slow, gentle sync - tune to taste.
-PROFILE_VELOCITY = 40       # ~ moderate speed, 0 = max speed (unsafe default)
-PROFILE_ACCELERATION = 20
+# Per DYNAMIXEL's own docs and the ROBOTIS community forum, the
+# Profile Velocity/Acceleration combination is what determines vibration
+# and noise during motion - and if the profile's speed cap is LOWER than
+# the rate the goal position is actually being pushed forward at (which is
+# what continuous jogging does), the servo can never catch up to a
+# receding goal: it keeps re-triggering its acceleration ramp on every
+# 20 Hz update instead of settling into one smooth trapezoid. That
+# mismatch was the direct cause of the "shaky/vibrating" feel during jogging.
+#   old PROFILE_VELOCITY=40 raw -> 0.96 rad/s cap, but jog commands up to
+#   1.5 rad/s (JOINT_SPEED / GAMEPAD_JOINT_RATE) - the servo was literally
+#   incapable of keeping pace with its own goal.
+# 150 raw -> ~3.6 rad/s cap, ~2.4x headroom over the fastest jog rate, so
+# the servo is never the bottleneck. Acceleration scaled up by the same
+# ratio so the ramp itself doesn't become the new mismatch.
+#   40  raw = 0.96 rad/s = 0.64x the max jog rate -> servo LAGS behind its
+#                          own goal and re-accelerates constantly (original bug)
+#   70  raw = 1.68 rad/s = 1.12x -> still travelling when the next goal
+#                          arrives, so motion is continuous  <-- what we want
+#   150 raw = 3.60 rad/s = 2.40x -> finishes each 33 ms step early and sits
+#                          idle waiting, i.e. stop/start micro-stutter
+# ROBOTIS: "when a DYNAMIXEL receives an updated Goal Position while it is
+# moving toward the previous one, velocity is adjusted smoothly" - that only
+# holds while it is STILL MOVING, hence matching the cap to the jog rate.
+PROFILE_VELOCITY = 70
+PROFILE_ACCELERATION = 40
+
+# Position-loop PID gains for the ARM joints (11-14). The XM430 ships with
+# P=800, I=0, and - critically - **D=0**, i.e. NO damping in the position
+# loop at all. ROBOTIS's own open_manipulator firmware never overrides
+# these, so this arm has been running undamped. Per ROBOTIS's PID tuning
+# guide (robotis.us/pid-tuning-for-dynamixel), D gain "adds damping by
+# reacting to how fast the error changes... reduces overshoot and improves
+# settling near the target" - with D=0 a joint carrying real load hunts
+# around its goal instead of settling, which is why IDs 11 (base yaw
+# carrying the whole arm) and 12 (shoulder holding it against gravity)
+# vibrate at rest while the lighter elbow/wrist don't.
+#
+# TUNING, if the defaults below aren't right for your arm:
+#   still vibrating  -> raise POSITION_D_GAIN (try +400 at a time)
+#   buzzing / harsh  -> too much D, lower it; D amplifies sensor noise
+#   sagging or soft  -> raise POSITION_P_GAIN back toward/above 800
+# P is left at the factory 800 deliberately: lowering it is the other
+# documented way to kill oscillation, but it also weakens the arm's hold
+# against gravity, so damping first is the safer lever.
+POSITION_P_GAIN = 800   # factory default
+POSITION_I_GAIN = 0     # factory default
+POSITION_D_GAIN = 1000  # factory default is 0 - this is the fix
 
 # Gripper: these are ROBOTIS's own official values, taken directly from
 # open_manipulator_libs (github.com/ROBOTIS-GIT/open_manipulator, noetic
@@ -109,6 +156,13 @@ PLAYBACK_APPROACH_TIME = 2.5  # seconds to ease from the current pose into frame
 PLAYBACK_APPROACH_RATE = 50.0 # Hz for that easing ramp
 RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "recordings")
 
+# Home position - the arm's resting pose. [joint1, joint2, joint3, joint4,
+# gripper_left, gripper_right] matching self.target's layout (gripper_right
+# mirrors gripper_left, same as everywhere else in this file).
+HOME_POSITION = np.array([1.589, 0.330, -0.107, 1.663, 0.0066, 0.0066])
+HOME_APPROACH_TIME = 2.5    # seconds to ease into home, same feel as playback's approach ramp
+HOME_APPROACH_RATE = 50.0   # Hz for that easing ramp
+
 XML_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "open_manipulator_x.xml")
 
 JOINT_SPECS = [
@@ -122,7 +176,7 @@ JOINT_SPECS = [
 
 # Keyboard jog controls: key -> (ctrl_idx, direction)
 KEY_BINDINGS = {
-    "a": (0, -1), "d": (0, +1),   # base
+    "a": (0, +1), "d": (0, -1),   # base
     "w": (1, +1), "s": (1, -1),   # shoulder
     "i": (2, +1), "k": (2, -1),   # elbow
     "j": (3, -1), "l": (3, +1),   # wrist
@@ -221,15 +275,54 @@ class HardwareLink:
         self.torque_on = False
         self.status_cb = status_cb
         self.sync_reader = None
+        # Last goal tick actually sent per motor, so identical goals aren't
+        # re-sent every tick - see sync_write_ticks for why that matters.
+        self.last_sent_ticks = {}
         # A pyserial port is not safe for concurrent access, but this class
         # is called from several threads at once: the sim loop reads/writes
-        # it continuously (feedback @30Hz, goals @20Hz, error poll @1Hz),
+        # it continuously (feedback @30Hz, goals @30Hz, error poll @1Hz),
         # while Connect/Disconnect, Diagnose, Calibrate, and mirror-off all
         # call in directly from button handlers. Every method below that
         # touches self.port/self.packet holds this lock for its duration,
         # so two callers can never interleave writes/reads on the wire -
         # which was corrupting reads and dropping recorded frames.
         self.io_lock = threading.Lock()
+
+    def _write_position_gains(self, dxl_id):
+        """Arm joints only - the gripper runs current-based position control
+        with ROBOTIS's own tuning, so its gains are left alone. Caller must
+        already hold io_lock. Gains live in RAM, so this has to be re-applied
+        after any reboot (see recover())."""
+        self.packet.write2ByteTxRx(self.port, dxl_id, ADDR_POSITION_D_GAIN, POSITION_D_GAIN)
+        self.packet.write2ByteTxRx(self.port, dxl_id, ADDR_POSITION_I_GAIN, POSITION_I_GAIN)
+        self.packet.write2ByteTxRx(self.port, dxl_id, ADDR_POSITION_P_GAIN, POSITION_P_GAIN)
+
+    def apply_tuning(self, dxl_ids, p_gain, i_gain, d_gain, prof_vel, prof_acc):
+        """Live-writes position PID gains AND profile velocity/acceleration.
+        All of these are RAM registers, so they take effect immediately with
+        torque still on - which is what makes interactive tuning possible."""
+        with self.io_lock:
+            if not self.connected:
+                return False
+            for dxl_id in dxl_ids:
+                self.packet.write2ByteTxRx(self.port, dxl_id, ADDR_POSITION_D_GAIN, int(d_gain))
+                self.packet.write2ByteTxRx(self.port, dxl_id, ADDR_POSITION_I_GAIN, int(i_gain))
+                self.packet.write2ByteTxRx(self.port, dxl_id, ADDR_POSITION_P_GAIN, int(p_gain))
+                self.packet.write4ByteTxRx(self.port, dxl_id, ADDR_PROFILE_ACCELERATION, int(prof_acc))
+                self.packet.write4ByteTxRx(self.port, dxl_id, ADDR_PROFILE_VELOCITY, int(prof_vel))
+            return True
+
+    def read_position_gains(self, dxl_id):
+        """Returns (P, I, D) as the motor actually has them, or None."""
+        with self.io_lock:
+            if not self.connected:
+                return None
+            d, r1, _ = self.packet.read2ByteTxRx(self.port, dxl_id, ADDR_POSITION_D_GAIN)
+            i, r2, _ = self.packet.read2ByteTxRx(self.port, dxl_id, ADDR_POSITION_I_GAIN)
+            p, r3, _ = self.packet.read2ByteTxRx(self.port, dxl_id, ADDR_POSITION_P_GAIN)
+            if r1 != 0 or r2 != 0 or r3 != 0:
+                return None
+            return p, i, d
 
     def connect(self):
         with self.io_lock:
@@ -260,9 +353,10 @@ class HardwareLink:
         for dxl_id in DXL_IDS:
             self.packet.write1ByteTxRx(self.port, dxl_id, ADDR_TORQUE_ENABLE, 0)
             if dxl_id == GRIPPER_ID:
-                continue  # gripper gets its own profile settings below
+                continue  # gripper gets its own profile/gain setup below
             self.packet.write4ByteTxRx(self.port, dxl_id, ADDR_PROFILE_VELOCITY, PROFILE_VELOCITY)
             self.packet.write4ByteTxRx(self.port, dxl_id, ADDR_PROFILE_ACCELERATION, PROFILE_ACCELERATION)
+            self._write_position_gains(dxl_id)
 
         # Gripper: official ROBOTIS current-based position control setup
         # (see GRIPPER_COEFFICIENT comment above for the source). Checked
@@ -359,6 +453,10 @@ class HardwareLink:
             for dxl_id in DXL_IDS:
                 self.packet.write1ByteTxRx(self.port, dxl_id, ADDR_TORQUE_ENABLE, 1 if on else 0)
             self.torque_on = on
+            # While de-energised the arm can be moved by hand, so a cached
+            # goal no longer reflects reality - drop it so the first write
+            # after re-enabling torque always goes through.
+            self.last_sent_ticks.clear()
         self.status_cb("Torque ENABLED - real motors will follow sliders" if on else "Torque disabled")
 
     def find_gripper_stops(self, progress_cb=None):
@@ -439,15 +537,30 @@ class HardwareLink:
             return True
 
     def sync_write_ticks(self, id_to_tick: dict):
+        """Writes goal positions, skipping any motor whose goal hasn't
+        actually changed since the last write.
+
+        This matters more than it looks: the caller runs at a fixed rate
+        regardless of whether anything moved, so holding still used to
+        re-send the *identical* Goal Position ~30x/second. Every Goal
+        Position write restarts the servo's profile trajectory generator,
+        so a motor at rest was being told to re-plan a move to where it
+        already was, over and over - which shows up as buzzing/vibration on
+        whichever joints carry enough load to react (11 and 12 here).
+        Skipping unchanged goals lets a stationary joint actually settle."""
         with self.io_lock:
             if not self.connected or not self.torque_on:
                 return
+            changed = {i: t for i, t in id_to_tick.items() if self.last_sent_ticks.get(i) != t}
+            if not changed:
+                return
             writer = GroupSyncWrite(self.port, self.packet, ADDR_GOAL_POSITION, LEN_GOAL_POSITION)
-            for dxl_id, tick in id_to_tick.items():
+            for dxl_id, tick in changed.items():
                 data = [DXL_LOBYTE(DXL_LOWORD(tick)), DXL_HIBYTE(DXL_LOWORD(tick)),
                         DXL_LOBYTE(DXL_HIWORD(tick)), DXL_HIBYTE(DXL_HIWORD(tick))]
                 writer.addParam(dxl_id, data)
-            writer.txPacket()
+            if writer.txPacket() == 0:
+                self.last_sent_ticks.update(changed)
             writer.clearParam()
 
     def read_position_limits(self, dxl_id):
@@ -493,6 +606,12 @@ class HardwareLink:
             else:
                 self.packet.write4ByteTxRx(self.port, dxl_id, ADDR_PROFILE_VELOCITY, PROFILE_VELOCITY)
                 self.packet.write4ByteTxRx(self.port, dxl_id, ADDR_PROFILE_ACCELERATION, PROFILE_ACCELERATION)
+                # Position gains are RAM too - a reboot resets D back to 0,
+                # which would silently bring the vibration straight back.
+                self._write_position_gains(dxl_id)
+            # The motor lost its goal position across the reboot, so the
+            # deadband cache below is stale - force the next write through.
+            self.last_sent_ticks.pop(dxl_id, None)
             if self.torque_on:
                 self.packet.write1ByteTxRx(self.port, dxl_id, ADDR_TORQUE_ENABLE, 1)
 
@@ -505,6 +624,7 @@ class HardwareLink:
                     self.port.closePort()
                 self.torque_on = False
             self.connected = False
+            self.last_sent_ticks.clear()
         self.status_cb("Torque disabled")
 
 
@@ -553,6 +673,7 @@ class DigitalTwinApp:
         self.frames = []
         self.playing = False
         self.stop_playback = threading.Event()
+        self.homing = False
 
         self.ee_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "end_effector")
         if self.ee_site_id < 0:
@@ -572,6 +693,11 @@ class DigitalTwinApp:
 
         self.sim_thread = threading.Thread(target=self._sim_loop, daemon=True)
         self.sim_thread.start()
+
+        # Serial I/O runs on its own thread so blocking bus transactions can
+        # never stall the motion loop - see _hw_loop for the measurements.
+        self.hw_thread = threading.Thread(target=self._hw_loop, daemon=True)
+        self.hw_thread.start()
 
         self._poll_keyboard_refresh()
         self._poll_ee_readout()
@@ -616,6 +742,13 @@ class DigitalTwinApp:
             val_label = ttk.Label(sliders, width=8, text=f"{self.target[ctrl_idx]:.3f}")
             val_label.grid(row=row, column=2, padx=6)
             self.scale_vars.append((var, val_label, ctrl_idx, scale))
+
+        self.home_btn = ttk.Button(sliders, text="Home Position", command=self.on_go_home)
+        self.home_btn.grid(row=len(JOINT_SPECS), column=0, columnspan=2, sticky="w", padx=6, pady=(6, 6))
+
+        self.home_status_var = tk.StringVar(value="")
+        ttk.Label(sliders, textvariable=self.home_status_var).grid(
+            row=len(JOINT_SPECS), column=2, sticky="w", padx=6)
 
         fb = ttk.LabelFrame(self.root, text="Live Motor Feedback (present position read from the real arm)")
         fb.grid(row=4, column=0, sticky="ew", **pad)
@@ -663,6 +796,49 @@ class DigitalTwinApp:
         self.record_status_var = tk.StringVar(value="No recording. Connect, then TORQUE OFF to hand-guide.")
         ttk.Label(rec, textvariable=self.record_status_var, wraplength=560).grid(
             row=1, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 6))
+
+        tune = ttk.LabelFrame(self.root, text="Position Gain Tuning (live - fixes joint vibration at rest)")
+        tune.grid(row=7, column=0, sticky="ew", **pad)
+
+        ttk.Label(tune, text="Joint:").grid(row=0, column=0, sticky="e", padx=(8, 2), pady=6)
+        self.tune_target_var = tk.StringVar(value="All arm (11-14)")
+        self.tune_target_combo = ttk.Combobox(
+            tune, textvariable=self.tune_target_var, width=16, state="readonly",
+            values=["All arm (11-14)"] + [f"{spec[0]} (ID {spec[2]})" for spec in JOINT_SPECS if spec[5] == "rad"])
+        self.tune_target_combo.grid(row=0, column=1, sticky="w", padx=(0, 10))
+
+        ttk.Label(tune, text="P:").grid(row=0, column=2, sticky="e", padx=(6, 2))
+        self.tune_p_var = tk.StringVar(value=str(POSITION_P_GAIN))
+        ttk.Entry(tune, textvariable=self.tune_p_var, width=7).grid(row=0, column=3, sticky="w")
+
+        ttk.Label(tune, text="D:").grid(row=0, column=4, sticky="e", padx=(6, 2))
+        self.tune_d_var = tk.StringVar(value=str(POSITION_D_GAIN))
+        ttk.Entry(tune, textvariable=self.tune_d_var, width=7).grid(row=0, column=5, sticky="w")
+
+        ttk.Label(tune, text="Vel:").grid(row=0, column=6, sticky="e", padx=(6, 2))
+        self.tune_vel_var = tk.StringVar(value=str(PROFILE_VELOCITY))
+        ttk.Entry(tune, textvariable=self.tune_vel_var, width=6).grid(row=0, column=7, sticky="w")
+
+        ttk.Label(tune, text="Acc:").grid(row=0, column=8, sticky="e", padx=(6, 2))
+        self.tune_acc_var = tk.StringVar(value=str(PROFILE_ACCELERATION))
+        ttk.Entry(tune, textvariable=self.tune_acc_var, width=6).grid(row=0, column=9, sticky="w")
+
+        self.tune_apply_btn = ttk.Button(tune, text="Apply", command=self.on_apply_gains, state="disabled")
+        self.tune_apply_btn.grid(row=0, column=10, padx=8)
+
+        self.tune_read_btn = ttk.Button(tune, text="Read current", command=self.on_read_gains, state="disabled")
+        self.tune_read_btn.grid(row=0, column=11, padx=4)
+
+        ttk.Label(tune, wraplength=600, foreground="#444", text=(
+            "All four apply instantly with torque on - no restart. "
+            "Vibrating at rest: lower P in ~200 steps (800->600->400), stop when the buzz goes. "
+            "Stuttering while moving: Vel too HIGH makes it finish each step early and wait "
+            "(70 tracks a 1.5 rad/s jog); too LOW makes it lag behind.")).grid(
+            row=1, column=0, columnspan=12, sticky="w", padx=8, pady=(0, 4))
+
+        self.tune_status_var = tk.StringVar(value="Connect to enable live tuning.")
+        ttk.Label(tune, textvariable=self.tune_status_var, wraplength=600).grid(
+            row=2, column=0, columnspan=12, sticky="w", padx=8, pady=(0, 6))
 
         gp = ttk.LabelFrame(self.root, text="Gamepad Teleop")
         gp.grid(row=6, column=0, sticky="ew", **pad)
@@ -780,6 +956,10 @@ class DigitalTwinApp:
         self.root.after(0, lambda: self.diag_btn.config(state="normal"))
         self.root.after(0, lambda: self.calib_btn.config(state="normal"))
         self.root.after(0, lambda: self.record_btn.config(state="normal"))
+        self.root.after(0, lambda: self.tune_apply_btn.config(state="normal"))
+        self.root.after(0, lambda: self.tune_read_btn.config(state="normal"))
+        self.root.after(0, lambda: self.tune_status_var.set(
+            "Live tuning ready - vibrating joint? Lower P and Apply, no restart needed."))
         self.root.after(0, self._refresh_playback_buttons)
 
     def _sync_targets_from_ticks_locked(self, ticks):
@@ -853,6 +1033,51 @@ class DigitalTwinApp:
     def on_estop(self):
         self.hw.set_torque(False)
 
+    def on_go_home(self):
+        if self.recording or self.playing or self.homing:
+            return
+        threading.Thread(target=self._go_home_worker, daemon=True).start()
+
+    def _go_home_worker(self):
+        # "Override everything": this is the same "one thing owns the
+        # target" rule as Record/Play - mirror, cartesian jog, gamepad, the
+        # sliders, and manual torque toggling are all locked out for the
+        # duration so nothing fights the move, and restored when it's done.
+        self.homing = True
+        self.root.after(0, lambda: self.home_btn.config(state="disabled"))
+        self.root.after(0, lambda: self.record_btn.config(state="disabled"))
+        self.root.after(0, lambda: self.play_btn.config(state="disabled"))
+        self.root.after(0, lambda: self._set_teach_mode_controls(True))
+        if self.mirror_mode:
+            self.mirror_var.set(False)
+            self.mirror_mode = False
+            self.root.after(0, lambda: self.mirror_note_var.set("Mirror OFF: cancelled by Home Position."))
+        try:
+            with self.lock:
+                start_pose = np.copy(self.target)
+            home = np.clip(HOME_POSITION, self.model.jnt_range[:6, 0], self.model.jnt_range[:6, 1])
+            for ctrl_idx in range(4):
+                lo, hi = self.joint_limits[ctrl_idx]
+                home[ctrl_idx] = max(lo, min(hi, home[ctrl_idx]))
+
+            self.home_status_var.set("Moving to home...")
+            steps = max(1, int(HOME_APPROACH_TIME * HOME_APPROACH_RATE))
+            for i in range(steps + 1):
+                a = i / steps
+                a = a * a * (3 - 2 * a)   # smoothstep: no jerk at either end
+                with self.lock:
+                    self.target[:] = start_pose + a * (home - start_pose)
+                    self.target[5] = self.target[4]
+                self.root.after(0, self._refresh_sliders_from_target)
+                time.sleep(1.0 / HOME_APPROACH_RATE)
+            self.home_status_var.set("At home position.")
+        finally:
+            self.homing = False
+            self.root.after(0, lambda: self.home_btn.config(state="normal"))
+            self.root.after(0, lambda: self.record_btn.config(state="normal"))
+            self.root.after(0, lambda: self._set_teach_mode_controls(False))
+            self.root.after(0, self._refresh_playback_buttons)
+
     def on_disconnect(self):
         """Releases /dev/ttyUSB0 so DYNAMIXEL Wizard (or anything else) can
         open it - only one program can hold the port at a time. Stops
@@ -876,6 +1101,8 @@ class DigitalTwinApp:
         self.calib_btn.config(state="disabled")
         self.record_btn.config(state="disabled")
         self.play_btn.config(state="disabled")
+        self.tune_apply_btn.config(state="disabled")
+        self.tune_read_btn.config(state="disabled")
         self.connect_btn.config(state="normal")
         self.set_status(f"Disconnected - {DEVICENAME} is free (e.g. for DYNAMIXEL Wizard). "
                         f"Click Connect to resume.")
@@ -929,6 +1156,56 @@ class DigitalTwinApp:
 
     def on_toggle_gamepad(self):
         self.gamepad_enabled = bool(self.gamepad_var.get())
+
+    def _tune_selected_ids(self):
+        """Which motor IDs the tuning panel currently targets."""
+        choice = self.tune_target_var.get()
+        arm_ids = [spec[2] for spec in JOINT_SPECS if spec[5] == "rad"]
+        if choice.startswith("All"):
+            return arm_ids
+        for spec in JOINT_SPECS:
+            if spec[5] == "rad" and f"(ID {spec[2]})" in choice:
+                return [spec[2]]
+        return arm_ids
+
+    def on_apply_gains(self):
+        try:
+            p = int(float(self.tune_p_var.get()))
+            d = int(float(self.tune_d_var.get()))
+            vel = int(float(self.tune_vel_var.get()))
+            acc = int(float(self.tune_acc_var.get()))
+        except ValueError:
+            self.tune_status_var.set("P, D, Vel and Acc must all be numbers.")
+            return
+        if not (0 <= p <= 16383 and 0 <= d <= 16383):
+            self.tune_status_var.set("P and D must be within 0-16383 (DYNAMIXEL gain range).")
+            return
+        if vel <= 0 or acc <= 0:
+            # 0 means "no profile / maximum speed" on a DYNAMIXEL, which for
+            # a streamed goal means an uncontrolled full-speed lunge.
+            self.tune_status_var.set("Vel and Acc must be > 0 (0 disables the profile = full-speed moves).")
+            return
+        ids = self._tune_selected_ids()
+
+        def worker():
+            ok = self.hw.apply_tuning(ids, p, POSITION_I_GAIN, d, vel, acc)
+            rad_s = vel * 0.229 * (2 * math.pi / 60)
+            self.root.after(0, lambda: self.tune_status_var.set(
+                f"Applied P={p} D={d} Vel={vel} ({rad_s:.2f} rad/s cap) Acc={acc} to ID {ids}."
+                if ok else "Not connected - cannot apply."))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_read_gains(self):
+        ids = self._tune_selected_ids()
+
+        def worker():
+            parts = []
+            for dxl_id in ids:
+                gains = self.hw.read_position_gains(dxl_id)
+                parts.append(f"ID{dxl_id}: P={gains[0]} I={gains[1]} D={gains[2]}"
+                             if gains else f"ID{dxl_id}: <read failed>")
+            self.root.after(0, lambda: self.tune_status_var.set("   ".join(parts)))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _poll_gamepad_readout(self):
         if self.gamepad is not None:
@@ -994,7 +1271,7 @@ class DigitalTwinApp:
             self.gamepad_enabled = False
 
     def on_toggle_record(self):
-        if self.playing:
+        if self.playing or self.homing:
             return
         if not self.recording:
             if not self.hw.connected:
@@ -1041,7 +1318,7 @@ class DigitalTwinApp:
             self._set_record_status(f"Recorded {count} frames over {dur:.1f} s. Press Play to replay it.")
 
     def on_toggle_play(self):
-        if self.recording:
+        if self.recording or self.homing:
             return
         if self.playing:
             self.stop_playback.set()
@@ -1341,19 +1618,30 @@ class DigitalTwinApp:
         self.root.after(0, self._refresh_sliders_from_target)
 
     def _sim_loop(self):
+        """Motion + rendering only - deliberately contains NO serial I/O.
+
+        Serial calls block for milliseconds, and while they lived in this
+        loop they stalled it 30x/second. Measured: p50 2.07 ms but p99
+        5-8 ms, i.e. a 2.5-4x periodic hitch at exactly the hardware rate -
+        which is what "moving with breakers in between" feels like. All
+        hardware traffic now runs on its own thread, see _hw_loop.
+        """
         dt = self.model.opt.timestep
         self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
-        hw_tick_accum = 0.0
-        hw_period = 1.0 / 20.0    # hardware writes at 20 Hz
-        err_tick_accum = 0.0
-        err_period = 1.0          # hardware error poll + auto-recover at 1 Hz
-        fb_tick_accum = 0.0
-        fb_period = 1.0 / 30.0    # feedback read at 30 Hz (one sync-read each)
         pick_tick_accum = 0.0
         pick_period = 1.0 / 15.0  # workspace-sphere pick poll at 15 Hz
+        last_t = time.perf_counter()
 
         with mujoco.viewer.launch_passive(self.model, self.data, key_callback=self._on_glfw_key) as viewer:
             while viewer.is_running() and not self.stop_event.is_set():
+                # Integrate jog motion against the WALL CLOCK rather than the
+                # sim timestep: the loop assumed 2.0 ms per iteration while
+                # actually taking 2.3-2.5 ms, so every jog ran at only 81-88%
+                # of its commanded speed and drifted with system load.
+                now = time.perf_counter()
+                elapsed = min(now - last_t, 0.05)  # cap, so a stall can't fling the arm
+                last_t = now
+
                 # --- Workspace-sphere click pick ----------------------------
                 # MuJoCo's viewer handles body selection/dragging internally
                 # (ctrl+double-click-drag is its convention - see the
@@ -1362,7 +1650,7 @@ class DigitalTwinApp:
                 # apply that as a physical force in passive mode unless we
                 # ask it to, so reading it here is purely a coordinate pick,
                 # not a real interaction with the arm.
-                pick_tick_accum += dt
+                pick_tick_accum += elapsed
                 if pick_tick_accum >= pick_period:
                     pick_tick_accum = 0.0
                     if (viewer.perturb.select == self.workspace_body_id
@@ -1372,31 +1660,6 @@ class DigitalTwinApp:
                         xpos = self.data.xpos[self.workspace_body_id]
                         world_pt = xpos + xmat @ viewer.perturb.localpos
                         self.root.after(0, lambda p=np.copy(world_pt): self._on_workspace_pick(p))
-
-                # --- Read feedback from every motor -------------------------
-                fb_tick_accum += dt
-                if fb_tick_accum >= fb_period:
-                    fb_tick_accum = 0.0
-                    if self.hw.connected and not self.calibrating:
-                        ticks = self.hw.read_all_ticks_fast()
-                        if ticks:
-                            complete = all(i in ticks for i in DXL_IDS)
-                            with self.lock:
-                                self.present_ticks = ticks
-                                # Mirror mode and recording both make the
-                                # physical arm the source of truth: it drives
-                                # the twin's targets rather than the reverse.
-                                if (self.mirror_mode or self.recording) and complete:
-                                    self._sync_targets_from_ticks_locked(ticks)
-                                    if self.recording:
-                                        stamp = time.time() - self.record_started_at
-                                        pose = np.copy(self.target)
-                                        # Only keep frames where something
-                                        # actually moved, so holding still
-                                        # doesn't bloat the recording.
-                                        if (not self.frames or
-                                                np.max(np.abs(pose - self.frames[-1][1])) > RECORD_MIN_DELTA):
-                                            self.frames.append((stamp, pose))
 
                 # --- Gamepad poll --------------------------------------------
                 # pygame calls happen outside self.lock (unrelated to what it
@@ -1411,14 +1674,14 @@ class DigitalTwinApp:
                         self.gamepad_buttons_snapshot = gp_buttons
 
                 with self.lock:
-                    jog_allowed = not self.mirror_mode and not self.recording and not self.playing
+                    jog_allowed = not self.mirror_mode and not self.recording and not self.playing and not self.homing
                     if self.keys_held and jog_allowed:
                         if self.cartesian_jog_enabled:
                             delta = np.zeros(3)
                             for key in self.keys_held:
                                 if key in CARTESIAN_KEY_BINDINGS:
                                     axis, direction = CARTESIAN_KEY_BINDINGS[key]
-                                    delta[axis] += direction * CARTESIAN_JOG_RATE * dt
+                                    delta[axis] += direction * CARTESIAN_JOG_RATE * elapsed
                             if np.any(delta):
                                 self.target[:4] = self.cartesian_jog_step(self.target[:4].copy(), delta)
                         else:
@@ -1426,7 +1689,7 @@ class DigitalTwinApp:
                                 if key in KEY_BINDINGS:
                                     ctrl_idx, direction = KEY_BINDINGS[key]
                                     lo, hi = self.joint_limits[ctrl_idx]
-                                    self.target[ctrl_idx] += direction * JOINT_SPEED[ctrl_idx] * dt
+                                    self.target[ctrl_idx] += direction * JOINT_SPEED[ctrl_idx] * elapsed
                                     self.target[ctrl_idx] = max(lo, min(hi, self.target[ctrl_idx]))
 
                     if self.gamepad_enabled and gp_axes is not None and jog_allowed:
@@ -1438,15 +1701,15 @@ class DigitalTwinApp:
                             # Left stick = horizontal plane (X/Y), right stick
                             # vertical (Z) - stick "up" (negative raw axis) is
                             # +X / +Z, matching typical flight-stick intuition.
-                            delta = np.array([-ly, lx, -ry]) * CARTESIAN_JOG_RATE * dt
+                            delta = np.array([-ly, lx, -ry]) * CARTESIAN_JOG_RATE * elapsed
                             if np.any(delta):
                                 self.target[:4] = self.cartesian_jog_step(self.target[:4].copy(), delta)
                         else:
-                            for ctrl_idx, stick_val in ((0, lx), (1, -ly), (2, -ry), (3, rx)):
+                            for ctrl_idx, stick_val in ((0, -lx), (1, -ly), (2, -ry), (3, rx)):
                                 if stick_val == 0.0:
                                     continue
                                 lo, hi = self.joint_limits[ctrl_idx]
-                                self.target[ctrl_idx] += stick_val * GAMEPAD_JOINT_RATE * dt
+                                self.target[ctrl_idx] += stick_val * GAMEPAD_JOINT_RATE * elapsed
                                 self.target[ctrl_idx] = max(lo, min(hi, self.target[ctrl_idx]))
                         gripper_dir = 0
                         if gp_buttons and len(gp_buttons) > GAMEPAD_BTN_GRIPPER_CLOSE and gp_buttons[GAMEPAD_BTN_GRIPPER_CLOSE]:
@@ -1455,7 +1718,7 @@ class DigitalTwinApp:
                             gripper_dir += 1
                         if gripper_dir:
                             lo, hi = self.joint_limits[4]
-                            self.target[4] += gripper_dir * GAMEPAD_GRIPPER_RATE * dt
+                            self.target[4] += gripper_dir * GAMEPAD_GRIPPER_RATE * elapsed
                             self.target[4] = max(lo, min(hi, self.target[4]))
 
                     # gripper_right_joint mirrors gripper_left_joint (the URDF's
@@ -1469,37 +1732,73 @@ class DigitalTwinApp:
                 mujoco.mj_step(self.model, self.data)
                 viewer.sync()
 
-                hw_tick_accum += dt
-                if hw_tick_accum >= hw_period:
-                    hw_tick_accum = 0.0
-                    # Hold off hardware writes during the calibration sweep
-                    # (the 20 Hz goal stream would fight it) and in mirror
-                    # mode (where the robot is driving the twin, not vice
-                    # versa - writing back would fight the operator's hand).
-                    if (self.hw.connected and self.hw.torque_on and not self.calibrating
-                            and not self.mirror_mode and not self.recording):
-                        id_to_tick = {}
-                        for label, ctrl_idx, dxl_id, lo, hi, kind in JOINT_SPECS:
-                            val = clipped[ctrl_idx]
-                            if kind == "gripper":
-                                id_to_tick[dxl_id] = gripper_to_tick(
-                                    val, lo, hi, self.gripper_tick_at_lo, self.gripper_tick_at_hi)
-                            else:
-                                id_to_tick[dxl_id] = rad_to_tick(val)
-                        self.hw.sync_write_ticks(id_to_tick)
-
-                err_tick_accum += dt
-                if err_tick_accum >= err_period:
-                    err_tick_accum = 0.0
-                    if self.hw.connected:
-                        errors = self.hw.check_hardware_errors()
-                        for dxl_id, err_byte in errors.items():
-                            desc = decode_hw_error(err_byte)
-                            self.set_status(f"ID {dxl_id} hardware error: {desc} - auto-recovering...")
-                            self.hw.recover(dxl_id)
-                            self.set_status(f"ID {dxl_id} recovered from {desc}")
-
                 time.sleep(dt)
+
+    def _hw_loop(self):
+        """All serial traffic, on its own thread at a steady rate.
+
+        Split out of _sim_loop because serial calls block for milliseconds:
+        running them inline made the motion loop hitch 30x/second (p99 rose
+        from ~2 ms to 5-8 ms), which is felt as stuttering while jogging.
+        Out here a slow bus transaction delays only the next hardware
+        update, never the motion integration or the render."""
+        hw_period = 1.0 / 30.0
+        err_period = 1.0
+        last_err = time.perf_counter()
+
+        while not self.stop_event.is_set():
+            cycle_start = time.perf_counter()
+
+            # `calibrating` holds io_lock for its whole sweep; skipping here
+            # keeps this thread from queueing up behind it.
+            if self.hw.connected and not self.calibrating:
+                ticks = self.hw.read_all_ticks_fast()
+                if ticks:
+                    complete = all(i in ticks for i in DXL_IDS)
+                    with self.lock:
+                        self.present_ticks = ticks
+                        # Mirror mode and recording both make the physical
+                        # arm the source of truth: it drives the twin's
+                        # targets rather than the reverse.
+                        if (self.mirror_mode or self.recording) and complete:
+                            self._sync_targets_from_ticks_locked(ticks)
+                            if self.recording:
+                                stamp = time.time() - self.record_started_at
+                                pose = np.copy(self.target)
+                                # Only keep frames where something actually
+                                # moved, so holding still doesn't bloat it.
+                                if (not self.frames or
+                                        np.max(np.abs(pose - self.frames[-1][1])) > RECORD_MIN_DELTA):
+                                    self.frames.append((stamp, pose))
+
+                # Don't write goals in mirror/record (the robot is driving
+                # the twin there - writing back would fight the operator).
+                if (self.hw.torque_on and not self.mirror_mode and not self.recording):
+                    with self.lock:
+                        snapshot = np.copy(self.target)
+                    clipped = np.clip(snapshot, self.model.jnt_range[:6, 0], self.model.jnt_range[:6, 1])
+                    id_to_tick = {}
+                    for label, ctrl_idx, dxl_id, lo, hi, kind in JOINT_SPECS:
+                        val = clipped[ctrl_idx]
+                        if kind == "gripper":
+                            id_to_tick[dxl_id] = gripper_to_tick(
+                                val, lo, hi, self.gripper_tick_at_lo, self.gripper_tick_at_hi)
+                        else:
+                            id_to_tick[dxl_id] = rad_to_tick(val)
+                    self.hw.sync_write_ticks(id_to_tick)
+
+                if time.perf_counter() - last_err >= err_period:
+                    last_err = time.perf_counter()
+                    for dxl_id, err_byte in self.hw.check_hardware_errors().items():
+                        desc = decode_hw_error(err_byte)
+                        self.set_status(f"ID {dxl_id} hardware error: {desc} - auto-recovering...")
+                        self.hw.recover(dxl_id)
+                        self.set_status(f"ID {dxl_id} recovered from {desc}")
+
+            # Pace by how long the cycle actually took, so bus latency
+            # doesn't compound into an ever-slower update rate.
+            remaining = hw_period - (time.perf_counter() - cycle_start)
+            time.sleep(remaining if remaining > 0 else 0.001)
 
     def on_close(self):
         self.stop_event.set()

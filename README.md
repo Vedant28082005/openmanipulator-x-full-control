@@ -141,7 +141,7 @@ and hit **Solve & Move**.
 2. **Enable Torque** — re-syncs the target to the arm's *actual* current
    position first, then energizes. The arm should not move at all the moment
    torque comes on.
-3. Now the sliders/keyboard/gamepad/IK all drive the real arm too, at 20 Hz.
+3. Now the sliders/keyboard/gamepad/IK all drive the real arm too, at 30 Hz.
 4. **TORQUE OFF (E-STOP)** is always live, regardless of what mode you're in.
 5. **Disconnect** frees the serial port (e.g. to switch to DYNAMIXEL Wizard)
    without closing the app.
