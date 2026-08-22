@@ -652,6 +652,48 @@ nav button.on{color:var(--red)}
 .offline{background:var(--red);color:#fff;text-align:center;padding:7px;
   font-size:12px;font-weight:700;display:none}
 .offline.show{display:block}
+
+/* ---- responsive: tablet and desktop ----------------------------------
+   Everything above is mobile-first and correct on a phone. On a wider screen
+   the same single column stretches each slider across the full width, which
+   puts the label at one edge and the value at the other and makes a 24-inch
+   monitor harder to use than a handset.
+
+   Past 720px the cards flow into an auto-fitting grid with a capped measure,
+   so they sit side by side instead of stretching. align-items:start stops a
+   short card being padded out to match a tall neighbour.
+
+   The tab bar stays fixed at the bottom rather than moving to the top: it
+   comes after <main> in the document, so making it static would drop it below
+   the content. Instead it becomes a centred floating bar, which reads as
+   deliberate on a desktop rather than as a phone UI stretched wide. */
+@media (min-width:720px){
+  main{max-width:1000px;margin:0 auto;padding:18px}
+  .panel.show{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+    gap:14px;align-items:start}
+  .card{margin-bottom:0}
+  header{padding:12px 18px}
+  .hrow,.pills,.statebar{max-width:1000px;margin-left:auto;margin-right:auto}
+  nav{left:50%;right:auto;transform:translateX(-50%);width:min(600px,94vw);
+    border:1px solid var(--line);border-bottom:0;border-radius:14px 14px 0 0}
+  nav button{padding:11px 2px 10px;font-size:11px}
+  .toast{bottom:calc(92px + var(--safe-b))}
+}
+@media (min-width:1180px){
+  main{max-width:1300px;padding:22px}
+  .hrow,.pills,.statebar{max-width:1300px}
+  /* Once there is room, let the live feed use two columns - it is the one
+     card whose usefulness scales with size. :has() degrades silently to the
+     normal one-column card on a browser that lacks it. */
+  .panel.show > .card:has(.camwrap){grid-column:span 2}
+}
+/* A mouse has no 48px finger, but shrinking targets would hurt touch laptops
+   and tablets, so sizes are left alone; only the pointer feedback changes. */
+@media (hover:hover) and (pointer:fine){
+  .btn:hover{background:#2a323e}
+  nav button:hover{color:var(--txt)}
+  .jogbtn:hover{background:#2a323e}
+}
 /* Camera. The wrap keeps a 16:9 box whether or not a frame ever arrives, so
    the page does not jump when the feed appears, disappears, or reconnects. */
 .camwrap{position:relative;width:100%;aspect-ratio:16/9;background:#0b0e12;
