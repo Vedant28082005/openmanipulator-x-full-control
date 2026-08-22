@@ -536,7 +536,17 @@ header{position:sticky;top:0;z-index:20;background:rgba(15,18,22,.94);
   box-shadow:0 2px 0 var(--red-dim);cursor:pointer}
 .estop:active{transform:translateY(2px);box-shadow:none}
 .pills{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
-.pill{font-size:11px;font-weight:600;padding:4px 9px;border-radius:99px;
+/* Says, in words, what the arm will actually do if you touch something. The
+   pills above are precise but assume you know what "TORQUE" means; an operator
+   who does not needs to be told plainly whether the real arm is live. */
+.statebar{margin-top:8px;font-size:12.5px;line-height:1.45;padding:8px 10px;
+  border-radius:9px;border:1px solid var(--line);background:var(--card)}
+.statebar b{font-weight:700}
+.statebar.live{border-color:var(--amber);background:rgba(245,165,36,.12)}
+.statebar.live b{color:var(--amber)}
+.statebar.idle{border-color:var(--line)}
+.statebar.sim{border-color:var(--line);color:var(--muted)}
+.pill{font-size:12px;font-weight:600;padding:5px 10px;border-radius:99px;
   border:1px solid var(--line);color:var(--muted);background:var(--card);white-space:nowrap}
 .pill.on{color:#04150f;background:var(--green);border-color:transparent}
 .pill.warn{color:#1a1204;background:var(--amber);border-color:transparent}
@@ -663,6 +673,7 @@ PAGE_BODY = """
     <button class="estop" id="estop">TORQUE OFF<br>E-STOP</button>
   </div>
   <div class="pills" id="pills"></div>
+  <div class="statebar sim" id="statebar">Connecting...</div>
 </header>
 
 <main>
@@ -835,6 +846,7 @@ const $ = id => document.getElementById(id);
 let dragging = null;      // joint index currently under the finger
 let editing  = null;      // text field currently focused
 let lastOk   = Date.now();
+let CURF     = {};      // newest flags, for handlers that must know the state
 
 function toast(msg){
   const t = $('toast'); t.textContent = msg; t.classList.add('show');
@@ -951,7 +963,18 @@ $('estop').onclick = ()=>{ releaseAll(); post('estop',{}); toast('E-STOP - torqu
 $('home').onclick  = ()=>post('home',{});
 $('hw-connect').onclick    = ()=>post('connect',{});
 $('hw-disconnect').onclick = ()=>post('disconnect',{});
-$('hw-torque').onclick     = ()=>post('torque',{});
+/* Enabling torque energises a physical arm that can move and, on release,
+   drop. It is the one control here with a real-world consequence that cannot
+   be undone by clicking again, so it asks first. Disabling is NEVER confirmed:
+   turning power off is a safety action and must stay instant. */
+$('hw-torque').onclick     = ()=>{
+  if(!CURF.torque && !confirm(
+      'Enable torque?\n\n'
+    + 'The arm will power up and hold its position. It may move as it takes up '
+    + 'slack, and controls will drive the real arm from then on.\n\n'
+    + 'Check the area around the arm is clear.')) return;
+  post('torque',{});
+};
 $('hw-diag').onclick       = ()=>post('diagnose',{});
 $('hw-calib').onclick      = ()=>post('calibrate',{});
 $('rec').onclick   = ()=>post('record',{});
@@ -996,6 +1019,24 @@ function pill(txt, cls){ return '<span class="pill '+(cls||'')+'">'+txt+'</span>
 
 function render(s){
   const f = s.flags, st = s.status, en = s.enabled;
+  CURF = f;
+
+  const sb = $('statebar');
+  if(!f.connected){
+    sb.className = 'statebar sim';
+    sb.innerHTML = '<b>Not connected.</b> Controls move the 3D model only \u2014 '
+                 + 'the real arm will not move. Go to Setup and press Connect.';
+  }else if(!f.torque){
+    sb.className = 'statebar idle';
+    sb.innerHTML = '<b>Connected, power OFF.</b> The arm is limp and may sag. '
+                 + 'Controls move the model only. Press Enable Torque in Setup '
+                 + 'to drive the real arm.';
+  }else{
+    sb.className = 'statebar live';
+    sb.innerHTML = '<b>Arm is LIVE.</b> It is powered and holding position \u2014 '
+                 + 'anything you move here moves the real arm. E-STOP cuts power '
+                 + 'instantly (the arm will drop).';
+  }
 
   $('pills').innerHTML =
       pill(f.connected ? 'CONNECTED' : 'SIM ONLY', f.connected ? 'on' : '')
