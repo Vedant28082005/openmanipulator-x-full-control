@@ -245,16 +245,6 @@ def _safe_recording_name(name):
     return name
 
 
-def _set_joint(app, idx, value, g):
-    lo, hi = app.joint_limits.get(idx, (-3.15, 3.15))
-    value = max(lo, min(hi, float(value)))
-    for var, label, ctrl_idx, scale in app.scale_vars:
-        if ctrl_idx == idx:
-            var.set(value)      # drags the desktop slider to match
-            break
-    app._on_slider(idx, value)
-
-
 def perform(app, g, action, body):
     """Run one web action. Returns a small dict; the real feedback the phone
     sees is the next /api/state poll, exactly like the desktop panel's own
@@ -292,10 +282,7 @@ def perform(app, g, action, body):
     elif action == "run_pick_place":
         tk_call(app.on_run_pick_place)
 
-    # --- joints and jogging ----------------------------------------------
-    elif action == "joint":
-        idx, value = int(body["idx"]), float(body["value"])
-        tk_call(lambda: _set_joint(app, idx, value, g))
+    # --- jogging -----------------------------------------------------------
     elif action == "jog":
         key = str(body.get("key", ""))
         if key not in g.KEY_BINDINGS and key not in g.CARTESIAN_KEY_BINDINGS:
@@ -638,23 +625,6 @@ main{padding:14px}
 .status{font-size:12px;color:var(--muted);line-height:1.5;margin-top:10px;
   padding-top:10px;border-top:1px solid var(--line);word-wrap:break-word}
 
-/* ---- sliders ---- */
-.jrow{margin-bottom:16px}
-.jhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}
-.jname{font-size:13px;font-weight:600}
-.jname span{color:var(--dim);font-weight:500}
-.jval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--txt)}
-/* Full tap-target height: the visible track stays slim, the grabbable strip
-   around it is what gets to 44px so a thumb can actually catch it. */
-input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:44px;
-  background:transparent;margin:0}
-input[type=range]::-webkit-slider-runnable-track{height:8px;border-radius:99px;background:var(--card-2);border:1px solid var(--line)}
-input[type=range]::-moz-range-track{height:8px;border-radius:99px;background:var(--card-2);border:1px solid var(--line)}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:26px;
-  border-radius:50%;background:var(--txt);border:3px solid var(--red);margin-top:-9px}
-input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
-  background:var(--txt);border:3px solid var(--red)}
-input[type=range]:disabled{opacity:.4}
 
 /* ---- buttons ---- */
 button{font-family:inherit}
@@ -829,9 +799,8 @@ PAGE_BODY = """
       <div class="status" id="s-viewer3d"></div>
     </div>
     <div class="card">
-      <h2>Joint Control</h2>
-      <p class="hint">Drag to set each joint target. The twin always follows; the real arm follows too once torque is on.</p>
-      <div id="joints"></div>
+      <h2>Home</h2>
+      <p class="hint">Per-joint sliders were removed from this page - a continuous drag is a bad fit for a link that can lag, and a bigger control surface than a public panel needs. Use Jog for step-wise per-joint moves, Inverse Kinematics for a target position, or teach a Pick &amp; Place under Teach.</p>
       <button class="btn" id="home">Home Position</button>
       <div class="status" id="s-home"></div>
     </div>
@@ -999,7 +968,6 @@ PAGE_BODY = """
 
 PAGE_JS = """
 const $ = id => document.getElementById(id);
-let dragging = null;      // joint index currently under the finger
 let editing  = null;      // text field currently focused
 let lastOk   = Date.now();
 let CURF     = {};      // newest flags, for handlers that must know the state
@@ -1009,47 +977,14 @@ function toast(msg){
   clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), 1800);
 }
 
-async function post(action, body, timeoutMs){
-  const ctl = timeoutMs ? new AbortController() : null;
-  const timer = ctl ? setTimeout(()=>ctl.abort(), timeoutMs) : null;
+async function post(action, body){
   try{
     const r = await fetch('/api/'+action, {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{}),
-      signal: ctl ? ctl.signal : undefined});
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})});
     const j = await r.json();
     if(j && j.ok === false && j.error) toast(j.error);
     return j;
   }catch(e){ return null; }
-  finally{ if(timer) clearTimeout(timer); }
-}
-
-/* ---------- latency-tolerant joint sends ----------
-   A slider drag fires 'input' ~60x/second. Posting each one queued a request
-   per event, so on a slow link the arm replayed the ENTIRE drag path long
-   after the finger stopped - the "moves late, then moves again and again"
-   problem.
-
-   Instead: at most ONE request per joint in flight, and only ever the NEWEST
-   value. Intermediate positions are discarded, not queued - the operator cares
-   where the slider IS, never where it passed through. This makes the send rate
-   adapt to the link automatically: a fast link sends often, a slow one sends
-   rarely, and neither builds a backlog.
-
-   The timeout matters too: without it one stalled request would block that
-   joint's sends forever, and the arm would stop responding with no error. */
-const JSEND = {};
-function sendJoint(idx, value){
-  const st = JSEND[idx] || (JSEND[idx] = {pending:null, inflight:false});
-  st.pending = value;                 // newest wins, overwrites any older one
-  if(!st.inflight) pumpJoint(idx);
-}
-function pumpJoint(idx){
-  const st = JSEND[idx];
-  if(st.pending === null){ st.inflight = false; return; }
-  const v = st.pending;
-  st.pending = null;
-  st.inflight = true;
-  post('joint', {idx:idx, value:v}, 2000).then(()=>pumpJoint(idx));
 }
 
 /* ---------- tabs ---------- */
@@ -1210,39 +1145,6 @@ function render(s){
     + (f.calibrating ? pill('CALIBRATING', 'warn') : '')
     + (f.cartesian ? pill('CARTESIAN', '') : '');
 
-  /* joints */
-  const box = $('joints');
-  if(box.children.length !== s.joints.length){
-    box.innerHTML = s.joints.map(j =>
-      '<div class="jrow"><div class="jhead">' +
-        '<div class="jname">'+j.label.replace(/ - /,' <span>')+'</span></div>' +
-        '<div class="jval" id="jv'+j.idx+'"></div></div>' +
-        '<input type="range" id="js'+j.idx+'" min="'+j.lo+'" max="'+j.hi+
-        '" step="0.001"></div>').join('');
-    s.joints.forEach(j=>{
-      const sl = $('js'+j.idx);
-      sl.addEventListener('pointerdown', ()=>dragging = j.idx);
-      ['pointerup','pointercancel'].forEach(e=>sl.addEventListener(e, ()=>{
-        if(dragging===j.idx) dragging = null; }));
-      sl.addEventListener('input', ()=>{
-        $('jv'+j.idx).textContent = (+sl.value).toFixed(3);
-        sendJoint(j.idx, +sl.value);
-      });
-      // On release, make sure the exact final value lands even if the last
-      // in-flight request carried a slightly older one.
-      ['pointerup','pointercancel'].forEach(e=>sl.addEventListener(e, ()=>{
-        sendJoint(j.idx, +sl.value); }));
-    });
-  }
-  s.joints.forEach(j=>{
-    const sl = $('js'+j.idx);
-    // Never fight the finger: skip the joint being dragged right now.
-    if(dragging === j.idx) return;
-    if(+sl.min !== j.lo) sl.min = j.lo;
-    if(+sl.max !== j.hi) sl.max = j.hi;
-    sl.value = j.value;
-    $('jv'+j.idx).textContent = j.value.toFixed(3);
-  });
 
   /* jog */
   buildPads(f.cartesian);
