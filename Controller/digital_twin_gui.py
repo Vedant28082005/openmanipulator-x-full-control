@@ -172,6 +172,8 @@ HOME_POSITION = np.array([1.589, 0.330, -0.107, 1.663, 0.0066, 0.0066])
 HOME_APPROACH_TIME = 2.5    # seconds to ease into home, same feel as playback's approach ramp
 HOME_APPROACH_RATE = 50.0   # Hz for that easing ramp
 
+GRIPPER_ACTION_SETTLE = 1.0  # seconds to hold after a scripted gripper close/open before moving on
+
 # Runtime options, set from the command line in __main__. Defaults keep the
 # desktop behaviour exactly as it was.
 class Options:
@@ -735,6 +737,13 @@ class DigitalTwinApp:
         self.stop_playback = threading.Event()
         self.homing = False
 
+        # Pick & Place: 3 taught joint-space waypoints (each a 6-vector
+        # snapshot of self.target), None until captured. Kept as plain data
+        # rather than something loaded from a file - re-teaching after moving
+        # the bench is one press per waypoint, and nothing here claims to know
+        # where a real object is without a camera telling it so.
+        self.action_poses = {"hover": None, "pickup": None, "place": None}
+
         self.ee_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "end_effector")
         if self.ee_site_id < 0:
             raise RuntimeError("open_manipulator_x.xml has no 'end_effector' site - rerun urdf-xml.py")
@@ -933,8 +942,42 @@ class DigitalTwinApp:
         ttk.Label(rec, textvariable=self.record_status_var, wraplength=560).grid(
             row=1, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 6))
 
+        # Quick Actions: single-press gripper presets, and a taught Pick & Place
+        # sequence - ROBOTIS's own flagship OpenManipulator-X demo, adapted for
+        # a bench with no camera/AR-marker perception. Rather than guess at
+        # real-world coordinates (which could drive the gripper into the table
+        # or grasp at nothing), the three waypoints are TAUGHT: jog the arm by
+        # hand or by slider, press Capture at each of Hover/Pickup/Place, then
+        # Run plays the same eased ramp Home Position uses between them.
+        act = ttk.LabelFrame(self.container, text="Quick Actions (gripper presets, taught Pick && Place)")
+        act.grid(row=6, column=0, sticky="ew", **pad)
+
+        ttk.Button(act, text="Open Gripper", command=lambda: self.on_gripper_preset(False)).grid(
+            row=0, column=0, padx=6, pady=6)
+        ttk.Button(act, text="Close Gripper", command=lambda: self.on_gripper_preset(True)).grid(
+            row=0, column=1, padx=6, pady=6)
+
+        ttk.Separator(act, orient="vertical").grid(row=0, column=2, rowspan=2, sticky="ns", padx=4)
+
+        self.capture_btns = {}
+        for col, name in ((3, "hover"), (4, "pickup"), (5, "place")):
+            btn = ttk.Button(act, text=f"Capture {name.capitalize()}",
+                              command=lambda n=name: self.on_capture_pose(n))
+            btn.grid(row=0, column=col, padx=6, pady=6)
+            self.capture_btns[name] = btn
+
+        self.pickplace_run_btn = ttk.Button(act, text="Run Pick && Place",
+                                             command=self.on_run_pick_place, state="disabled")
+        self.pickplace_run_btn.grid(row=0, column=6, padx=6, pady=6)
+
+        self.pickplace_status_var = tk.StringVar(
+            value="Jog to a hover height above the object, click Capture Hover; same for Pickup (lowered onto "
+                  "it) and Place (drop-off). Run plays: hover -> pickup -> close -> hover -> place -> open -> hover.")
+        ttk.Label(act, textvariable=self.pickplace_status_var, wraplength=560).grid(
+            row=1, column=0, columnspan=7, sticky="w", padx=8, pady=(0, 6))
+
         tune = ttk.LabelFrame(self.container, text="Position Gain Tuning (live - fixes joint vibration at rest)")
-        tune.grid(row=7, column=0, sticky="ew", **pad)
+        tune.grid(row=8, column=0, sticky="ew", **pad)
 
         ttk.Label(tune, text="Joint:").grid(row=0, column=0, sticky="e", padx=(8, 2), pady=6)
         self.tune_target_var = tk.StringVar(value="All arm (11-14)")
@@ -977,7 +1020,7 @@ class DigitalTwinApp:
             row=2, column=0, columnspan=12, sticky="w", padx=8, pady=(0, 6))
 
         gp = ttk.LabelFrame(self.container, text="Gamepad Teleop")
-        gp.grid(row=6, column=0, sticky="ew", **pad)
+        gp.grid(row=7, column=0, sticky="ew", **pad)
 
         self.gamepad_connect_btn = ttk.Button(gp, text="Connect Gamepad", command=self.on_connect_gamepad)
         self.gamepad_connect_btn.grid(row=0, column=0, padx=6, pady=6)
@@ -999,7 +1042,7 @@ class DigitalTwinApp:
             row=3, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
 
         remote = ttk.LabelFrame(self.container, text="Remote Access (mobile web panel)")
-        remote.grid(row=8, column=0, sticky="ew", **pad)
+        remote.grid(row=9, column=0, sticky="ew", **pad)
 
         self.web_url_var = tk.StringVar(value="Web panel starting...")
         ttk.Label(remote, textvariable=self.web_url_var, wraplength=600,
@@ -1186,6 +1229,35 @@ class DigitalTwinApp:
             return
         threading.Thread(target=self._go_home_worker, daemon=True).start()
 
+    def _ease_target_to(self, dest_pose, ease_gripper=True):
+        """Smoothly ramps self.target from wherever it is now to dest_pose
+        over HOME_APPROACH_TIME - the exact loop Home Position used to run
+        inline. Pulled out so Pick & Place can reuse the identical, already-
+        tuned motion for each leg of its sequence rather than a second copy
+        that could quietly drift out of sync with Home's feel over time.
+
+        ease_gripper=False leaves target[4] (and its mirror, target[5]) alone
+        for the whole ramp. Pick & Place needs this: hover/pickup/place are
+        taught poses that each freeze whatever gripper opening happened to be
+        set at teach time, and blending that in while lifting or retreating
+        would silently open a gripper that Pick & Place had just closed
+        around an object. Home wants the opposite - HOME_POSITION specifies a
+        real gripper target and returning it there is the point - so it keeps
+        the default."""
+        with self.lock:
+            start_pose = np.copy(self.target)
+        steps = max(1, int(HOME_APPROACH_TIME * HOME_APPROACH_RATE))
+        for i in range(steps + 1):
+            a = i / steps
+            a = a * a * (3 - 2 * a)   # smoothstep: no jerk at either end
+            with self.lock:
+                self.target[:4] = start_pose[:4] + a * (dest_pose[:4] - start_pose[:4])
+                if ease_gripper:
+                    self.target[4] = start_pose[4] + a * (dest_pose[4] - start_pose[4])
+                self.target[5] = self.target[4]
+            self.root.after(0, self._refresh_sliders_from_target)
+            time.sleep(1.0 / HOME_APPROACH_RATE)
+
     def _go_home_worker(self):
         # "Override everything": this is the same "one thing owns the
         # target" rule as Record/Play - mirror, cartesian jog, gamepad, the
@@ -1201,23 +1273,13 @@ class DigitalTwinApp:
             self.mirror_mode = False
             self.root.after(0, lambda: self.mirror_note_var.set("Mirror OFF: cancelled by Home Position."))
         try:
-            with self.lock:
-                start_pose = np.copy(self.target)
             home = np.clip(HOME_POSITION, self.model.jnt_range[:6, 0], self.model.jnt_range[:6, 1])
             for ctrl_idx in range(4):
                 lo, hi = self.joint_limits[ctrl_idx]
                 home[ctrl_idx] = max(lo, min(hi, home[ctrl_idx]))
 
             self.home_status_var.set("Moving to home...")
-            steps = max(1, int(HOME_APPROACH_TIME * HOME_APPROACH_RATE))
-            for i in range(steps + 1):
-                a = i / steps
-                a = a * a * (3 - 2 * a)   # smoothstep: no jerk at either end
-                with self.lock:
-                    self.target[:] = start_pose + a * (home - start_pose)
-                    self.target[5] = self.target[4]
-                self.root.after(0, self._refresh_sliders_from_target)
-                time.sleep(1.0 / HOME_APPROACH_RATE)
+            self._ease_target_to(home)
             self.home_status_var.set("At home position.")
         finally:
             self.homing = False
@@ -1225,6 +1287,105 @@ class DigitalTwinApp:
             self.root.after(0, lambda: self.record_btn.config(state="normal"))
             self.root.after(0, lambda: self._set_teach_mode_controls(False))
             self.root.after(0, self._refresh_playback_buttons)
+
+    def on_gripper_preset(self, closed: bool):
+        """One-press gripper open/close, driven by the same calibrated
+        joint_limits[4] the slider already respects (so Calibrate Gripper
+        re-measuring the travel keeps this correct with no extra work)."""
+        if self.recording or self.playing or self.homing:
+            return
+        lo, hi = self.joint_limits[4]
+        with self.lock:
+            self.target[4] = lo if closed else hi
+            self.target[5] = self.target[4]
+        self.root.after(0, self._refresh_sliders_from_target)
+
+    def on_capture_pose(self, name: str):
+        """Snapshots the CURRENT target as one of Pick & Place's three
+        waypoints. Refused mid-motion (recording/playing/homing)
+        because otherwise it would capture whatever transient in-flight pose
+        the arm happens to be passing through, not a deliberate rest pose."""
+        if self.recording or self.playing or self.homing:
+            return
+        with self.lock:
+            pose = np.copy(self.target)
+        self.action_poses[name] = pose
+        self.pickplace_status_var.set(f"{name.capitalize()} captured.")
+        self._refresh_action_buttons()
+
+    def _refresh_action_buttons(self):
+        ready = all(pose is not None for pose in self.action_poses.values())
+        busy = self.recording or self.playing or self.homing
+        self.pickplace_run_btn.config(state="normal" if (ready and not busy) else "disabled")
+
+    def on_run_pick_place(self):
+        if self.recording or self.playing or self.homing:
+            return
+        if any(pose is None for pose in self.action_poses.values()):
+            self.pickplace_status_var.set("Capture Hover, Pickup, and Place first.")
+            return
+        threading.Thread(target=self._pick_place_worker, daemon=True).start()
+
+    def _pick_place_worker(self):
+        # Reuses self.homing as the busy flag, same "one thing owns the
+        # target" lockout _go_home_worker uses - every gate that already
+        # checks self.homing (jog, the gamepad Y binding, Home's own guard)
+        # then also backs off for a running Pick & Place, at the cost of the
+        # web UI's "HOMING" pill showing during one too. A second flag that
+        # would always agree with this one isn't worth carrying.
+        self.homing = True
+        self.root.after(0, lambda: self.home_btn.config(state="disabled"))
+        self.root.after(0, lambda: self.record_btn.config(state="disabled"))
+        self.root.after(0, lambda: self.play_btn.config(state="disabled"))
+        self.root.after(0, lambda: self._set_teach_mode_controls(True))
+        self.root.after(0, self._refresh_action_buttons)
+        if self.mirror_mode:
+            self.mirror_var.set(False)
+            self.mirror_mode = False
+            self.root.after(0, lambda: self.mirror_note_var.set("Mirror OFF: cancelled by Pick & Place."))
+        try:
+            lo4, hi4 = self.joint_limits[4]
+            hover = self.action_poses["hover"]
+            pickup = self.action_poses["pickup"]
+            place = self.action_poses["place"]
+
+            def status(text):
+                self.pickplace_status_var.set(text)
+
+            # Every ease below is ease_gripper=False: the gripper is driven
+            # ONLY by the two explicit writes (close after Pickup, open after
+            # Place), never blended in from a taught pose's frozen opening -
+            # see _ease_target_to's docstring for why that matters.
+            status("Moving to hover...")
+            self._ease_target_to(hover, ease_gripper=False)
+            status("Descending to pickup...")
+            self._ease_target_to(pickup, ease_gripper=False)
+            status("Closing gripper...")
+            with self.lock:
+                self.target[4] = lo4
+                self.target[5] = self.target[4]
+            self.root.after(0, self._refresh_sliders_from_target)
+            time.sleep(GRIPPER_ACTION_SETTLE)
+            status("Lifting...")
+            self._ease_target_to(hover, ease_gripper=False)
+            status("Moving to place...")
+            self._ease_target_to(place, ease_gripper=False)
+            status("Opening gripper...")
+            with self.lock:
+                self.target[4] = hi4
+                self.target[5] = self.target[4]
+            self.root.after(0, self._refresh_sliders_from_target)
+            time.sleep(GRIPPER_ACTION_SETTLE)
+            status("Retreating...")
+            self._ease_target_to(hover, ease_gripper=False)
+            status("Pick & Place complete.")
+        finally:
+            self.homing = False
+            self.root.after(0, lambda: self.home_btn.config(state="normal"))
+            self.root.after(0, lambda: self.record_btn.config(state="normal"))
+            self.root.after(0, lambda: self._set_teach_mode_controls(False))
+            self.root.after(0, self._refresh_playback_buttons)
+            self.root.after(0, self._refresh_action_buttons)
 
     def on_disconnect(self):
         """Releases /dev/ttyUSB0 so DYNAMIXEL Wizard (or anything else) can
@@ -1434,6 +1595,15 @@ class DigitalTwinApp:
         self.torque_btn.config(state="disabled" if active else ("normal" if self.hw.connected else "disabled"))
         for var, label, idx, scale in self.scale_vars:
             scale.config(state=state)
+        # Capturing a Pick & Place waypoint mid-motion would snapshot a
+        # transient in-flight pose rather than a deliberate rest pose, so it
+        # gets the same lockout as everything else here.
+        for btn in self.capture_btns.values():
+            btn.config(state=state)
+        if active:
+            self.pickplace_run_btn.config(state="disabled")
+        else:
+            self._refresh_action_buttons()
         if active and self.cartesian_jog_enabled:
             # Recording/playback owns the target; a stray held jog key from
             # before the mode switch shouldn't keep nudging it mid-capture.

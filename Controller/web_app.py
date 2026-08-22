@@ -171,6 +171,7 @@ def build_snapshot(app, g):
             "gamepad_raw": app.gamepad_raw_var.get(),
             "mirror_note": app.mirror_note_var.get(),
             "ee": app.ee_readout_var.get(),
+            "pickplace": app.pickplace_status_var.get(),
         },
         # Mirroring the desktop panel's own enable/disable logic rather than
         # re-deriving it keeps the two UIs in lockstep as that logic evolves.
@@ -185,6 +186,10 @@ def build_snapshot(app, g):
             "home": _btn_state(app.home_btn),
             "tune_apply": _btn_state(app.tune_apply_btn),
             "tune_read": _btn_state(app.tune_read_btn),
+            "run_pick_place": _btn_state(app.pickplace_run_btn),
+        },
+        "pickplace": {
+            name: (pose is not None) for name, pose in app.action_poses.items()
         },
         "labels": {
             "record": app.record_btn["text"],
@@ -274,6 +279,18 @@ def perform(app, g, action, body):
         tk_call(app.on_calibrate_gripper)
     elif action == "home":
         tk_call(app.on_go_home)
+
+    # --- quick actions: gripper presets, taught Pick && Place --------------
+    elif action == "gripper_preset":
+        closed = bool(body.get("closed"))
+        tk_call(lambda: app.on_gripper_preset(closed))
+    elif action == "capture_pose":
+        name = str(body.get("name", ""))
+        if name not in ("hover", "pickup", "place"):
+            return {"ok": False, "error": "unknown pose"}
+        tk_call(lambda: app.on_capture_pose(name))
+    elif action == "run_pick_place":
+        tk_call(app.on_run_pick_place)
 
     # --- joints and jogging ----------------------------------------------
     elif action == "joint":
@@ -650,6 +667,7 @@ button{font-family:inherit}
 .btn.primary{background:var(--red);border-color:transparent;color:#fff}
 .btn.ghost{background:transparent}
 .btn.live{background:var(--red);border-color:transparent;color:#fff}
+.btn.captured{border-color:var(--green);color:var(--green)}
 .grid{display:grid;gap:8px}
 .g2{grid-template-columns:1fr 1fr}
 .g3{grid-template-columns:repeat(3,1fr)}
@@ -867,6 +885,21 @@ PAGE_BODY = """
         <div class="sw" id="sw-loop"></div>
       </div>
       <div class="status" id="s-rec"></div>
+    </div>
+    <div class="card">
+      <h2>Quick Actions</h2>
+      <p class="hint">Open/Close move the gripper to its calibrated ends in one press. Pick &amp; Place is ROBOTIS's own flagship OpenManipulator-X demo, taught for your bench rather than guessed: jog to a hover height above the object and tap Capture Hover, then the same for Pickup (lowered onto it) and Place (drop-off). Run plays hover → pickup → close → hover → place → open → hover, eased the same way Home Position moves.</p>
+      <div class="grid g2" style="margin-bottom:8px">
+        <button class="btn" id="grip-open">Open Gripper</button>
+        <button class="btn" id="grip-close">Close Gripper</button>
+      </div>
+      <div class="grid g3" style="margin-bottom:8px">
+        <button class="btn ghost" id="cap-hover">Capture Hover</button>
+        <button class="btn ghost" id="cap-pickup">Capture Pickup</button>
+        <button class="btn ghost" id="cap-place">Capture Place</button>
+      </div>
+      <button class="btn primary" id="run-pickplace" disabled>Run Pick &amp; Place</button>
+      <div class="status" id="s-pickplace"></div>
     </div>
     <div class="card">
       <h2>Recordings</h2>
@@ -1103,6 +1136,12 @@ $('hw-calib').onclick      = ()=>post('calibrate',{});
 $('rec').onclick   = ()=>post('record',{});
 $('play').onclick  = ()=>post('play',{});
 $('rec-clear').onclick = ()=>post('clear',{});
+$('grip-open').onclick  = ()=>post('gripper_preset', {closed:false});
+$('grip-close').onclick = ()=>post('gripper_preset', {closed:true});
+$('cap-hover').onclick  = ()=>post('capture_pose', {name:'hover'});
+$('cap-pickup').onclick = ()=>post('capture_pose', {name:'pickup'});
+$('cap-place').onclick  = ()=>post('capture_pose', {name:'place'});
+$('run-pickplace').onclick = ()=>post('run_pick_place', {});
 $('tn-read').onclick   = ()=>post('gains_read',{});
 
 $('ik-solve').onclick = ()=>post('ik',
@@ -1232,6 +1271,15 @@ function render(s){
   $('home').disabled          = en.home       !== 'normal';
   $('tn-apply').disabled      = en.tune_apply !== 'normal';
   $('tn-read').disabled       = en.tune_read  !== 'normal';
+  $('run-pickplace').disabled = en.run_pick_place !== 'normal';
+  // Captured poses get a visual check so it's obvious at a glance which of
+  // the three waypoints still need teaching before Run will do anything.
+  ['hover','pickup','place'].forEach(function(name){
+    var btn = $('cap-'+name);
+    var got = !!(s.pickplace && s.pickplace[name]);
+    btn.classList.toggle('captured', got);
+    btn.textContent = 'Capture ' + name[0].toUpperCase() + name.slice(1) + (got ? ' \u2713' : '');
+  });
   $('rec').textContent  = s.labels.record.replace(/[^\\x20-\\x7e]/g,'').trim() || 'Record';
   $('play').textContent = s.labels.play.replace(/[^\\x20-\\x7e]/g,'').trim() || 'Play';
   $('rec').classList.toggle('live', f.recording);
@@ -1286,6 +1334,7 @@ function render(s){
   $('s-tune').textContent   = st.tune;
   $('s-ee').textContent     = st.ee;
   $('s-mirror').textContent = st.mirror_note;
+  $('s-pickplace').textContent = st.pickplace;
   $('s-gp').textContent     = st.gamepad + (st.gamepad_raw ? '\\n' + st.gamepad_raw : '');
 }
 
