@@ -474,8 +474,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/manifest.webmanifest":
             self._send(200, json.dumps({
                 "name": "OpenManipulator-X", "short_name": "OMX",
-                "display": "standalone", "background_color": "#12151a",
-                "theme_color": "#12151a", "start_url": "/",
+                "display": "standalone", "background_color": "#111214",
+                "theme_color": "#111214", "start_url": "/",
             }), "application/manifest+json")
         else:
             self._send(404, json.dumps({"error": "not found"}))
@@ -560,11 +560,21 @@ def start(app, gui_module, port=WEB_PORT, bind=WEB_BIND):
 
 PAGE_CSS = """
 *,*::before,*::after{box-sizing:border-box}
+/* Palette follows ISA-101 (ANSI/ISA-101.01-2015, the high-performance-HMI
+   standard for process/robot control): a desaturated grayscale base, with
+   color spent ONLY on states that need attention - amber for caution, red
+   for alarm/critical, blue for "operator action available". A live number or
+   a card title is not a deviation, so neither gets a decorative accent color
+   any more; --heading and --txt (both neutral) replaced what used to be
+   var(--cyan) on those. Every state that carries color also carries a text
+   label (the pills already said "TORQUE ON", not just showing a colored dot),
+   which is the other ISA-101 requirement - roughly 8% of men have red-green
+   color vision deficiency, so color alone must never be the only signal. */
 :root{
-  --bg:#0f1216; --card:#181d25; --card-2:#1f2630; --line:#2b3441;
-  --txt:#e8edf4; --muted:#8b97a8; --dim:#5f6b7d;
-  --red:#e8402a; --red-dim:#8f2a1c; --amber:#f5a524; --green:#20c997; --cyan:#22b8cf;
-  --r:14px; --tap:48px;
+  --bg:#111214; --card:#1a1b1f; --card-2:#212226; --line:#34363c;
+  --txt:#e7e8ea; --muted:#9a9da5; --dim:#6b6e76; --heading:#aeb1b8;
+  --red:#e2412c; --red-dim:#7a2a20; --amber:#f2a531; --green:#2f9e6e; --info:#4d8fdb;
+  --r:8px; --tap:48px;
   --safe-b:env(safe-area-inset-bottom,0px);
 }
 html,body{margin:0;padding:0;background:var(--bg);color:var(--txt);
@@ -573,14 +583,14 @@ html,body{margin:0;padding:0;background:var(--bg);color:var(--txt);
 body{padding-bottom:calc(72px + var(--safe-b))}
 
 /* ---- header ---- */
-header{position:sticky;top:0;z-index:20;background:rgba(15,18,22,.94);
-  backdrop-filter:blur(10px);border-bottom:1px solid var(--line);
+header{position:sticky;top:0;z-index:20;background:var(--bg);
+  border-bottom:1px solid var(--line);
   padding:10px 14px calc(10px) 14px}
 .hrow{display:flex;align-items:center;gap:10px}
 .brand{font-weight:700;font-size:15px;letter-spacing:.02em;flex:1;min-width:0}
 .brand small{display:block;font-weight:500;font-size:11px;color:var(--dim);
   letter-spacing:.06em;text-transform:uppercase}
-.estop{flex:none;background:var(--red);color:#fff;border:0;border-radius:10px;
+.estop{flex:none;background:var(--red);color:#fff;border:0;border-radius:8px;
   font-weight:800;font-size:12px;letter-spacing:.04em;padding:0 14px;height:44px;
   box-shadow:0 2px 0 var(--red-dim);cursor:pointer}
 .estop:active{transform:translateY(2px);box-shadow:none}
@@ -589,7 +599,7 @@ header{position:sticky;top:0;z-index:20;background:rgba(15,18,22,.94);
    pills above are precise but assume you know what "TORQUE" means; an operator
    who does not needs to be told plainly whether the real arm is live. */
 .statebar{margin-top:8px;font-size:12.5px;line-height:1.45;padding:8px 10px;
-  border-radius:9px;border:1px solid var(--line);background:var(--card)}
+  border-radius:8px;border:1px solid var(--line);background:var(--card)}
 .statebar b{font-weight:700}
 .statebar.live{border-color:var(--amber);background:rgba(245,165,36,.12)}
 .statebar.live b{color:var(--amber)}
@@ -606,7 +616,7 @@ main{padding:14px}
 .panel{display:none} .panel.show{display:block}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
   padding:14px;margin-bottom:12px}
-.card h2{margin:0 0 2px;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--cyan)}
+.card h2{margin:0 0 2px;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--heading)}
 .card p.hint{margin:0 0 12px;font-size:12px;color:var(--dim);line-height:1.45}
 .status{font-size:12px;color:var(--muted);line-height:1.5;margin-top:10px;
   padding-top:10px;border-top:1px solid var(--line);word-wrap:break-word}
@@ -616,7 +626,7 @@ main{padding:14px}
 .jhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}
 .jname{font-size:13px;font-weight:600}
 .jname span{color:var(--dim);font-weight:500}
-.jval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--cyan)}
+.jval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--txt)}
 /* Full tap-target height: the visible track stays slim, the grabbable strip
    around it is what gets to 44px so a thumb can actually catch it. */
 input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:44px;
@@ -632,7 +642,7 @@ input[type=range]:disabled{opacity:.4}
 /* ---- buttons ---- */
 button{font-family:inherit}
 .btn{display:flex;align-items:center;justify-content:center;gap:6px;
-  min-height:var(--tap);padding:0 14px;border-radius:11px;border:1px solid var(--line);
+  min-height:var(--tap);padding:0 14px;border-radius:8px;border:1px solid var(--line);
   background:var(--card-2);color:var(--txt);font-size:13px;font-weight:600;
   cursor:pointer;-webkit-tap-highlight-color:transparent;width:100%}
 .btn:active{background:#2a323e}
@@ -649,7 +659,7 @@ button{font-family:inherit}
   margin-bottom:10px}
 .pad .lbl{text-align:center;font-size:12px;font-weight:700;color:var(--muted);
   letter-spacing:.05em;min-width:74px}
-.jogbtn{min-height:56px;font-size:20px;font-weight:700;border-radius:12px;
+.jogbtn{min-height:56px;font-size:20px;font-weight:700;border-radius:8px;
   border:1px solid var(--line);background:var(--card-2);color:var(--txt);
   cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:none;user-select:none}
 .jogbtn:disabled{opacity:.35}
@@ -672,9 +682,9 @@ button{font-family:inherit}
 label.f{display:block;font-size:11px;color:var(--muted);margin-bottom:5px;
   letter-spacing:.04em;text-transform:uppercase}
 input[type=text],input[type=number],select{width:100%;height:var(--tap);padding:0 12px;
-  border-radius:11px;border:1px solid var(--line);background:var(--card-2);
+  border-radius:8px;border:1px solid var(--line);background:var(--card-2);
   color:var(--txt);font-size:15px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-input:focus,select:focus{outline:2px solid var(--cyan);outline-offset:-1px}
+input:focus,select:focus{outline:2px solid var(--info);outline-offset:-1px}
 select{font-family:inherit;appearance:none}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th{text-align:left;color:var(--dim);font-weight:600;font-size:10px;
@@ -686,7 +696,7 @@ td.n{font-family:inherit;font-weight:600}
 
 /* ---- tab bar ---- */
 nav{position:fixed;left:0;right:0;bottom:0;z-index:20;display:flex;
-  background:rgba(15,18,22,.96);backdrop-filter:blur(10px);
+  background:var(--bg);
   border-top:1px solid var(--line);padding-bottom:var(--safe-b)}
 nav button{flex:1;background:none;border:0;color:var(--dim);padding:9px 2px 8px;
   font-size:10px;font-weight:600;letter-spacing:.03em;cursor:pointer;
@@ -695,7 +705,7 @@ nav button .ic{display:block;font-size:19px;margin-bottom:2px;line-height:1}
 nav button.on{color:var(--red)}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(80px + var(--safe-b));
   background:var(--card-2);border:1px solid var(--line);color:var(--txt);
-  padding:11px 16px;border-radius:11px;font-size:13px;z-index:40;
+  padding:11px 16px;border-radius:8px;font-size:13px;z-index:40;
   opacity:0;transition:opacity .2s;pointer-events:none;max-width:86vw;text-align:center}
 .toast.show{opacity:1}
 .offline{background:var(--red);color:#fff;text-align:center;padding:7px;
@@ -724,7 +734,7 @@ nav button.on{color:var(--red)}
   header{padding:12px 18px}
   .hrow,.pills,.statebar{max-width:1000px;margin-left:auto;margin-right:auto}
   nav{left:50%;right:auto;transform:translateX(-50%);width:min(600px,94vw);
-    border:1px solid var(--line);border-bottom:0;border-radius:14px 14px 0 0}
+    border:1px solid var(--line);border-bottom:0;border-radius:10px 10px 0 0}
   nav button{padding:11px 2px 10px;font-size:11px}
   .toast{bottom:calc(92px + var(--safe-b))}
 }
@@ -745,7 +755,7 @@ nav button.on{color:var(--red)}
 }
 /* Camera. The wrap keeps a 16:9 box whether or not a frame ever arrives, so
    the page does not jump when the feed appears, disappears, or reconnects. */
-.camwrap{position:relative;width:100%;aspect-ratio:16/9;background:#0b0e12;
+.camwrap{position:relative;width:100%;aspect-ratio:16/9;background:#0a0b0d;
   border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .camwrap img{width:100%;height:100%;object-fit:contain;display:none}
 .camwrap img.live{display:block}
@@ -756,13 +766,15 @@ nav button.on{color:var(--red)}
 /* 3D digital twin. Same fixed-box pattern as the camera, own class so the
    two are never coupled - the viewer can fail to load WebGL/the model without
    touching camera markup or vice versa. */
-.viewer3d-wrap{position:relative;width:100%;aspect-ratio:4/3;background:#10141a;
+.viewer3d-wrap{position:relative;width:100%;aspect-ratio:4/3;background:#0a0b0d;
   border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .viewer3d-wrap canvas{width:100%;height:100%;display:block;touch-action:none}
 .viewer3d-off{position:absolute;inset:0;display:flex;align-items:center;
   justify-content:center;text-align:center;padding:12px;color:var(--dim);
-  font-size:13px;line-height:1.5;background:#10141a}
+  font-size:13px;line-height:1.5;background:#0a0b0d}
 .viewer3d-off.hide{display:none}
+.credit{text-align:center;font-size:11px;color:var(--dim);letter-spacing:.02em;
+  padding:4px 0 2px}
 """
 
 
@@ -938,6 +950,7 @@ PAGE_BODY = """
       <div class="status" id="s-gp"></div>
     </div>
   </section>
+  <div class="credit">Built by Dr. Ravi Kant &amp; Vedant Sutariya</div>
 </main>
 
 <nav>
@@ -1398,7 +1411,7 @@ VIEWER_JS = """
       }
 
       scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x10141a);
+      scene.background = new THREE.Color(0x0a0b0d);
       scene.add(new THREE.AmbientLight(0xffffff, 0.7));
       var dl = new THREE.DirectionalLight(0xffffff, 0.9);
       dl.position.set(1, 2, 1.5);
@@ -1481,7 +1494,7 @@ PAGE_HTML = ("<!doctype html><html lang=\"en\"><head>"
              "<meta charset=\"utf-8\">"
              "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,"
              "maximum-scale=1,viewport-fit=cover\">"
-             "<meta name=\"theme-color\" content=\"#0f1216\">"
+             "<meta name=\"theme-color\" content=\"#111214\">"
              "<meta name=\"mobile-web-app-capable\" content=\"yes\">"
              "<link rel=\"manifest\" href=\"/manifest.webmanifest\">"
              "<title>OpenManipulator-X</title>"
