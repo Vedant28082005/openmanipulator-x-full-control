@@ -841,14 +841,47 @@ function toast(msg){
   clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), 1800);
 }
 
-async function post(action, body){
+async function post(action, body, timeoutMs){
+  const ctl = timeoutMs ? new AbortController() : null;
+  const timer = ctl ? setTimeout(()=>ctl.abort(), timeoutMs) : null;
   try{
     const r = await fetch('/api/'+action, {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})});
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{}),
+      signal: ctl ? ctl.signal : undefined});
     const j = await r.json();
     if(j && j.ok === false && j.error) toast(j.error);
     return j;
   }catch(e){ return null; }
+  finally{ if(timer) clearTimeout(timer); }
+}
+
+/* ---------- latency-tolerant joint sends ----------
+   A slider drag fires 'input' ~60x/second. Posting each one queued a request
+   per event, so on a slow link the arm replayed the ENTIRE drag path long
+   after the finger stopped - the "moves late, then moves again and again"
+   problem.
+
+   Instead: at most ONE request per joint in flight, and only ever the NEWEST
+   value. Intermediate positions are discarded, not queued - the operator cares
+   where the slider IS, never where it passed through. This makes the send rate
+   adapt to the link automatically: a fast link sends often, a slow one sends
+   rarely, and neither builds a backlog.
+
+   The timeout matters too: without it one stalled request would block that
+   joint's sends forever, and the arm would stop responding with no error. */
+const JSEND = {};
+function sendJoint(idx, value){
+  const st = JSEND[idx] || (JSEND[idx] = {pending:null, inflight:false});
+  st.pending = value;                 // newest wins, overwrites any older one
+  if(!st.inflight) pumpJoint(idx);
+}
+function pumpJoint(idx){
+  const st = JSEND[idx];
+  if(st.pending === null){ st.inflight = false; return; }
+  const v = st.pending;
+  st.pending = null;
+  st.inflight = true;
+  post('joint', {idx:idx, value:v}, 2000).then(()=>pumpJoint(idx));
 }
 
 /* ---------- tabs ---------- */
@@ -990,8 +1023,12 @@ function render(s){
         if(dragging===j.idx) dragging = null; }));
       sl.addEventListener('input', ()=>{
         $('jv'+j.idx).textContent = (+sl.value).toFixed(3);
-        post('joint', {idx:j.idx, value:+sl.value});
+        sendJoint(j.idx, +sl.value);
       });
+      // On release, make sure the exact final value lands even if the last
+      // in-flight request carried a slightly older one.
+      ['pointerup','pointercancel'].forEach(e=>sl.addEventListener(e, ()=>{
+        sendJoint(j.idx, +sl.value); }));
     });
   }
   s.joints.forEach(j=>{
