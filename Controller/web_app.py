@@ -29,6 +29,22 @@ from urllib.parse import unquote
 
 WEB_PORT = 8080
 WEB_BIND = "0.0.0.0"       # reachable from the phone; see SECURITY note in README
+
+# 3D viewer static assets. REPO_ROOT holds the URDF and the meshes/ directory
+# it references; VENDOR_DIR holds a locally-vendored Three.js + urdf-loader,
+# fetched once at build time rather than from a CDN, so the viewer keeps
+# working with the Pi on an isolated network and no internet at all - the same
+# reason the rest of this app is stdlib-only.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MESHES_DIR = os.path.join(REPO_ROOT, "meshes")
+URDF_PATH = os.path.join(REPO_ROOT, "open_manipulator_x.xml").replace(".xml", ".urdf")
+VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "vendor")
+
+_STATIC_MIME = {
+    ".js": "text/javascript; charset=utf-8",
+    ".stl": "model/stl",
+    ".urdf": "application/xml",
+}
 STATE_PERIOD_MS = 100      # how often the Tk thread republishes web_state
 
 # Shared-secret gate, off unless OMX_WEB_TOKEN is set in the environment.
@@ -410,6 +426,33 @@ class _Handler(BaseHTTPRequestHandler):
     def _deny(self):
         self._send(401, json.dumps({"error": "unauthorised"}))
 
+    def _serve_static_file(self, root, rel_path):
+        """Serves rel_path from under root, or 404. Rejects anything that
+        would resolve outside root ("..", absolute paths, symlink escapes) -
+        the URDF/mesh/vendor routes are the only places this process opens a
+        file by a name that arrives in the request, so this is the one spot
+        traversal actually needs blocking."""
+        root = os.path.realpath(root)
+        target = os.path.realpath(os.path.join(root, rel_path))
+        if os.path.commonpath([root, target]) != root or not os.path.isfile(target):
+            self._send(404, json.dumps({"error": "not found"}))
+            return
+        ext = os.path.splitext(target)[1].lower()
+        ctype = _STATIC_MIME.get(ext, "application/octet-stream")
+        with open(target, "rb") as f:
+            body = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        # Meshes and vendored libraries never change at runtime; the browser
+        # can keep them indefinitely and re-fetch only after a restart.
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self):
         if not self._authorised():
             self._deny()
@@ -422,6 +465,12 @@ class _Handler(BaseHTTPRequestHandler):
             with self.app.web_state_lock:
                 state = self.app.web_state
             self._send(200, json.dumps(state))
+        elif path == "/model/robot.urdf":
+            self._serve_static_file(REPO_ROOT, "open_manipulator_x.urdf")
+        elif path.startswith("/model/meshes/"):
+            self._serve_static_file(MESHES_DIR, path[len("/model/meshes/"):])
+        elif path.startswith("/static/vendor/"):
+            self._serve_static_file(VENDOR_DIR, path[len("/static/vendor/"):])
         elif path == "/manifest.webmanifest":
             self._send(200, json.dumps({
                 "name": "OpenManipulator-X", "short_name": "OMX",
@@ -704,6 +753,16 @@ nav button.on{color:var(--red)}
   justify-content:center;text-align:center;padding:12px;color:var(--dim);
   font-size:13px;line-height:1.5}
 .camwrap img.live + .camoff{display:none}
+/* 3D digital twin. Same fixed-box pattern as the camera, own class so the
+   two are never coupled - the viewer can fail to load WebGL/the model without
+   touching camera markup or vice versa. */
+.viewer3d-wrap{position:relative;width:100%;aspect-ratio:4/3;background:#10141a;
+  border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.viewer3d-wrap canvas{width:100%;height:100%;display:block;touch-action:none}
+.viewer3d-off{position:absolute;inset:0;display:flex;align-items:center;
+  justify-content:center;text-align:center;padding:12px;color:var(--dim);
+  font-size:13px;line-height:1.5;background:#10141a}
+.viewer3d-off.hide{display:none}
 """
 
 
@@ -729,6 +788,15 @@ PAGE_BODY = """
       </div>
       <div class="status" id="s-cam"></div>
       <button class="btn" id="cam-btn">Pause feed</button>
+    </div>
+    <div class="card">
+      <h2>3D View</h2>
+      <p class="hint">Digital twin, visual only — drag to orbit, scroll or pinch to zoom.</p>
+      <div class="viewer3d-wrap">
+        <canvas id="viewer3d"></canvas>
+        <div class="viewer3d-off" id="viewer3d-off">Loading 3D view...</div>
+      </div>
+      <div class="status" id="s-viewer3d"></div>
     </div>
     <div class="card">
       <h2>Joint Control</h2>
@@ -1289,6 +1357,125 @@ CAMERA_JS = """
 })();
 """
 
+# A THIRD separate <script> tag, same reasoning as CAMERA_JS: whatever goes
+# wrong in here - WebGL unsupported, the model 404s, a vendored module fails
+# to parse - must never stop the arm-control script or the camera script from
+# running. Uses dynamic import() specifically so a broken/missing module
+# rejects a promise this code catches, rather than throwing at parse time the
+# way a static top-level `import` statement would.
+VIEWER_JS = """
+(function(){
+  try{
+    var wrap = document.querySelector('.viewer3d-wrap');
+    var canvas = document.getElementById('viewer3d');
+    var off = document.getElementById('viewer3d-off');
+    var st = document.getElementById('s-viewer3d');
+    if(!wrap || !canvas || !off) return;
+
+    var robot = null, scene, camera, renderer, controls, group;
+    // idx in /api/state's joints array -> URDF joint name. The gripper's
+    // mirror partner (gripper_right_joint) is a <mimic> of this one in the
+    // URDF, which urdf-loader resolves on its own - setting the left joint
+    // is enough to move both.
+    var JOINT_NAMES = ['joint1','joint2','joint3','joint4','gripper_left_joint'];
+
+    function setOff(msg){ off.textContent = msg; off.classList.remove('hide'); }
+    function setOn(){ off.classList.add('hide'); }
+
+    async function boot(){
+      if(!window.WebGLRenderingContext){
+        setOff('3D view needs WebGL, which this browser does not support.');
+        return;
+      }
+      var THREE, OrbitControls, URDFLoaderCtor;
+      try{
+        THREE = await import('/static/vendor/three.module.min.js');
+        OrbitControls = (await import('/static/vendor/OrbitControls.js')).OrbitControls;
+        URDFLoaderCtor = (await import('/static/vendor/URDFLoader.js')).default;
+      }catch(e){
+        setOff('3D view failed to load its viewer library.');
+        return;
+      }
+
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x10141a);
+      scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+      var dl = new THREE.DirectionalLight(0xffffff, 0.9);
+      dl.position.set(1, 2, 1.5);
+      scene.add(dl);
+      scene.add(new THREE.GridHelper(1, 10, 0x2b3441, 0x1c222b));
+
+      camera = new THREE.PerspectiveCamera(45, 4/3, 0.01, 10);
+      camera.position.set(0.55, 0.4, 0.55);
+
+      try{
+        renderer = new THREE.WebGLRenderer({canvas: canvas, antialias: true});
+      }catch(e){
+        setOff('3D view: WebGL context could not be created.');
+        return;
+      }
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.target.set(0, 0.15, 0);
+      controls.update();
+
+      // URDF/ROS is Z-up; three.js's usual convention (and OrbitControls'
+      // default up vector) is Y-up. Rotating the whole model onto that axis
+      // once, here, is simpler than fighting the camera/controls convention
+      // at every subsequent step.
+      group = new THREE.Group();
+      group.rotation.x = -Math.PI / 2;
+      scene.add(group);
+
+      var loader = new URDFLoaderCtor();
+      loader.load('/model/robot.urdf', function(result){
+        robot = result;
+        group.add(robot);
+        setOn();
+        if(st) st.textContent = 'Digital twin only - does not run the physics simulation.';
+      }, undefined, function(){
+        setOff('3D view: could not load the robot model.');
+      });
+
+      function resize(){
+        var w = wrap.clientWidth, h = wrap.clientHeight;
+        if(!w || !h) return;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h, false);
+      }
+      new ResizeObserver(resize).observe(wrap);
+      resize();
+
+      (function animate(){
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+      })();
+    }
+
+    function poll(){
+      fetch('/api/state', {cache:'no-store'})
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(s){
+          if(!s || !robot || !s.joints) return;
+          s.joints.forEach(function(j, i){
+            var name = JOINT_NAMES[i];
+            if(name) robot.setJointValue(name, j.value);
+          });
+        })
+        .catch(function(){ /* transient - next poll retries, cosmetic only */ });
+    }
+
+    boot();
+    setInterval(poll, 150);
+  }catch(e){ /* never let the 3D view break the panel or the camera */ }
+})();
+"""
+
+
 
 PAGE_HTML = ("<!doctype html><html lang=\"en\"><head>"
              "<meta charset=\"utf-8\">"
@@ -1301,4 +1488,5 @@ PAGE_HTML = ("<!doctype html><html lang=\"en\"><head>"
              "<style>" + PAGE_CSS + "</style></head><body>"
              + PAGE_BODY +
              "<script>" + PAGE_JS + "</script>"
-             "<script>" + CAMERA_JS + "</script></body></html>")
+             "<script>" + CAMERA_JS + "</script>"
+             "<script>" + VIEWER_JS + "</script></body></html>")
