@@ -969,9 +969,9 @@ $('hw-disconnect').onclick = ()=>post('disconnect',{});
    turning power off is a safety action and must stay instant. */
 $('hw-torque').onclick     = ()=>{
   if(!CURF.torque && !confirm(
-      'Enable torque?\n\n'
+      'Enable torque?\\n\\n'
     + 'The arm will power up and hold its position. It may move as it takes up '
-    + 'slack, and controls will drive the real arm from then on.\n\n'
+    + 'slack, and controls will drive the real arm from then on.\\n\\n'
     + 'Check the area around the arm is clear.')) return;
   post('torque',{});
 };
