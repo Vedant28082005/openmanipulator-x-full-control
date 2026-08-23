@@ -156,6 +156,10 @@ def build_snapshot(app, g):
             "cartesian": bool(app.cartesian_jog_var.get()),
             "loop": bool(app.loop_var.get()),
             "gamepad": bool(app.gamepad_var.get()),
+            # Whether a pad is actually open, as distinct from the enable
+            # toggle. The panel used to show only the toggle, so an unplugged
+            # or wedged pad still read as live.
+            "gamepad_present": app.gamepad is not None,
             "recording": bool(app.recording),
             "playing": bool(app.playing),
             "homing": bool(app.homing),
@@ -665,6 +669,9 @@ button{font-family:inherit}
   border-radius:50%;background:var(--muted);transition:transform .15s,background .15s}
 .sw.on{background:var(--red);border-color:transparent}
 .sw.on::after{transform:translateX(21px);background:#fff}
+/* No pad plugged in: the toggle is meaningless, so it reads as unavailable
+   rather than sitting there looking operable. */
+.sw.disabled{opacity:.35;pointer-events:none}
 
 /* ---- inputs / table ---- */
 label.f{display:block;font-size:11px;color:var(--muted);margin-bottom:5px;
@@ -943,8 +950,8 @@ PAGE_BODY = """
 
     <div class="card">
       <h2>Gamepad Teleop</h2>
-      <p class="hint">A pad plugged into the host machine, not the phone. Left stick base/shoulder, right stick wrist/elbow, LB/RB gripper.</p>
-      <button class="btn" id="gp-connect" style="margin-bottom:8px">Connect Gamepad</button>
+      <p class="hint">A pad plugged into the host machine, not the phone. Left stick base/shoulder, right stick wrist/elbow, LB/RB gripper. <b>Y</b> homes the arm, <b>X</b> plays the saved recording. Plugging a pad in is detected automatically — Rescan is only needed if that misses it.</p>
+      <button class="btn" id="gp-connect" style="margin-bottom:8px">Rescan for Gamepad</button>
       <div class="tog">
         <div><div class="t">Enable gamepad</div><div class="s">Uses the Cartesian mode toggle above.</div></div>
         <div class="sw" id="sw-gamepad"></div>
@@ -1161,6 +1168,9 @@ function render(s){
   $('sw-mirror').classList.toggle('on', f.mirror);
   $('sw-loop').classList.toggle('on', f.loop);
   $('sw-gamepad').classList.toggle('on', f.gamepad);
+  // Grey the toggle out when no pad is actually present, so the panel can
+  // never show "enabled" for a pad that is unplugged or gone.
+  $('sw-gamepad').classList.toggle('disabled', !f.gamepad_present);
 
   /* buttons follow the desktop panel's own enable logic */
   $('hw-connect').disabled    = en.connect    !== 'normal';

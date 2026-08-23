@@ -15,6 +15,7 @@ Hardware config (from DYNAMIXEL Wizard 2.0 scan):
 import json
 import math
 import os
+import traceback
 import sys
 import threading
 import time
@@ -245,6 +246,12 @@ GAMEPAD_AXIS_RIGHT_Y = 4
 GAMEPAD_BTN_GRIPPER_CLOSE = 4   # LB
 GAMEPAD_BTN_GRIPPER_OPEN = 5    # RB
 GAMEPAD_BTN_HOME = 3            # Y - go to home position
+GAMEPAD_BTN_PLAY = 2            # X - play PLAYBACK_RECORDING
+GAMEPAD_RESCAN_SECONDS = 2.0    # how often to look for a pad when none is connected
+
+# What the gamepad's X button plays. Kept as a filename resolved against
+# RECORDINGS_DIR rather than an absolute path, so it survives the repo moving.
+PLAYBACK_RECORDING = "fevicol.json"
 GAMEPAD_DEADZONE = 0.15
 GAMEPAD_JOINT_RATE = 1.5      # rad/s at full stick deflection
 GAMEPAD_CARTESIAN_RATE = 0.08 # m/s at full stick deflection
@@ -255,6 +262,7 @@ GAMEPAD_HELP = (
     "Right stick: joint mode -> Wrist/Elbow    cartesian mode -> Z (up/down)\n"
     "LB / RB: gripper close/open   -   Proportional to how far you push (analog).\n"
     "Y: return to home position (same 2.5s eased move as the Home button).\n"
+    "X: play the saved " + PLAYBACK_RECORDING + " recording (press again to stop).\n"
     "Uses the same Cartesian-jog-mode checkbox as the keyboard, above."
 )
 
@@ -718,6 +726,25 @@ class DigitalTwinApp:
         self.gamepad_axes_snapshot = []
         self.gamepad_buttons_snapshot = []
         self.gamepad_home_was_pressed = False
+        self.gamepad_play_was_pressed = False
+
+        # Gamepad ownership: ONLY the sim thread may touch pygame.joystick or
+        # the Joystick object. Everything else (the Connect button, the web
+        # API) asks by setting this event, and the sim loop performs the
+        # rescan itself on its next iteration.
+        #
+        # This is not stylistic. pygame.joystick.quit() invalidates every live
+        # Joystick object, and the old Connect handler called it directly from
+        # the Tk thread while this loop was mid-poll on that same object. The
+        # next get_axis() then raised out of _sim_loop, which has no exception
+        # handler, killing the thread outright - jog, target integration and
+        # all motion stopped, with the UI still cheerfully reporting the pad
+        # as connected and enabled. Nothing restarts that thread, which is why
+        # it took a reboot to recover.
+        self.gamepad_rescan_request = threading.Event()
+        self.gamepad_instance_id = None
+        self._gamepad_next_scan = 0.0
+        self._gamepad_enabled_before_lock = False
         # Gripper tick endpoints for slider min/max: directly measured in
         # DYNAMIXEL Wizard (closed=125.2deg, open=270.4deg), not calculated.
         # "Calibrate Gripper" can still re-measure and override these.
@@ -733,6 +760,12 @@ class DigitalTwinApp:
         self.recording = False
         self.record_started_at = 0.0
         self.frames = []
+        # Which file self.frames came from, or None for a live/unsaved take.
+        # Lets the gamepad's X button skip a redundant disk read when its
+        # recording is already loaded.
+        self.loaded_recording_path = None
+        self._sim_errors = 0
+        self._hw_errors = 0
         self.playing = False
         self.stop_playback = threading.Event()
         self.homing = False
@@ -1269,18 +1302,16 @@ class DigitalTwinApp:
         self.root.after(0, lambda: self.play_btn.config(state="disabled"))
         self.root.after(0, lambda: self._set_teach_mode_controls(True))
         if self.mirror_mode:
-            self.mirror_var.set(False)
-            self.mirror_mode = False
-            self.root.after(0, lambda: self.mirror_note_var.set("Mirror OFF: cancelled by Home Position."))
+            self._cancel_mirror_from_worker("Mirror OFF: cancelled by Home Position.")
         try:
             home = np.clip(HOME_POSITION, self.model.jnt_range[:6, 0], self.model.jnt_range[:6, 1])
             for ctrl_idx in range(4):
                 lo, hi = self.joint_limits[ctrl_idx]
                 home[ctrl_idx] = max(lo, min(hi, home[ctrl_idx]))
 
-            self.home_status_var.set("Moving to home...")
+            self._set_home_status("Moving to home...")
             self._ease_target_to(home)
-            self.home_status_var.set("At home position.")
+            self._set_home_status("At home position.")
         finally:
             self.homing = False
             self.root.after(0, lambda: self.home_btn.config(state="normal"))
@@ -1340,17 +1371,14 @@ class DigitalTwinApp:
         self.root.after(0, lambda: self._set_teach_mode_controls(True))
         self.root.after(0, self._refresh_action_buttons)
         if self.mirror_mode:
-            self.mirror_var.set(False)
-            self.mirror_mode = False
-            self.root.after(0, lambda: self.mirror_note_var.set("Mirror OFF: cancelled by Pick & Place."))
+            self._cancel_mirror_from_worker("Mirror OFF: cancelled by Pick & Place.")
         try:
             lo4, hi4 = self.joint_limits[4]
             hover = self.action_poses["hover"]
             pickup = self.action_poses["pickup"]
             place = self.action_poses["place"]
 
-            def status(text):
-                self.pickplace_status_var.set(text)
+            status = self._set_pickplace_status
 
             # Every ease below is ease_gripper=False: the gripper is driven
             # ONLY by the two explicit writes (close after Pickup, open after
@@ -1471,25 +1499,136 @@ class DigitalTwinApp:
             if self.cartesian_jog_enabled else "Cartesian jog off - keyboard jogs joints again.")
 
     def on_connect_gamepad(self):
-        pygame.joystick.quit()
-        pygame.joystick.init()
-        count = pygame.joystick.get_count()
-        if count == 0:
-            self.gamepad_status_var.set("No gamepad detected - plug it in and click Connect Gamepad again.")
-            self.gamepad_check.config(state="disabled")
-            self.gamepad = None
-            return
-        self.gamepad = pygame.joystick.Joystick(0)
-        self.gamepad.init()
-        self.gamepad_status_var.set(
-            f"Connected: {self.gamepad.get_name()}  "
-            f"({self.gamepad.get_numaxes()} axes, {self.gamepad.get_numbuttons()} buttons). "
-            f"If the mapping below looks wrong for your pad, watch the raw axis readout while "
-            f"moving each stick and adjust the GAMEPAD_AXIS_* constants at the top of the file.")
-        self.gamepad_check.config(state="normal")
+        """Asks the sim thread to (re)scan. Deliberately performs NO pygame
+        calls itself - see the gamepad_rescan_request comment in __init__ for
+        why doing so from this thread used to wedge the app until reboot."""
+        self.gamepad_status_var.set("Scanning for a gamepad...")
+        self.gamepad_rescan_request.set()
 
     def on_toggle_gamepad(self):
         self.gamepad_enabled = bool(self.gamepad_var.get())
+
+    # ---------------- Gamepad, owned entirely by the sim thread -----------
+
+    def _gamepad_set_status(self, text, connected):
+        """Push pad status back to the UI from the sim thread."""
+        def apply():
+            self.gamepad_status_var.set(text)
+            self.gamepad_check.config(
+                state="normal" if (connected and not (self.recording or self.playing
+                                                      or self.homing)) else "disabled")
+            if not connected:
+                # A pad that is gone cannot be "enabled" - leaving the box
+                # ticked was how the UI ended up claiming a frozen pad was
+                # live. Untick it so the panel and reality agree.
+                self.gamepad_var.set(False)
+                self.gamepad_enabled = False
+        self.root.after(0, apply)
+
+    def _gamepad_drop(self, reason):
+        """Forget the current pad. Safe to call from the sim thread only."""
+        if self.gamepad is not None:
+            try:
+                self.gamepad.quit()
+            except Exception:      # noqa: BLE001 - already going away
+                pass
+        self.gamepad = None
+        self.gamepad_instance_id = None
+        self.gamepad_home_was_pressed = False
+        self.gamepad_play_was_pressed = False
+        with self.lock:
+            self.gamepad_axes_snapshot = []
+            self.gamepad_buttons_snapshot = []
+        self._gamepad_set_status(reason, False)
+
+    def _gamepad_open_first(self):
+        """Open joystick 0 if there is one. Sim thread only."""
+        try:
+            if pygame.joystick.get_count() == 0:
+                self._gamepad_drop("No gamepad detected - plug one in "
+                                   "(it will be picked up automatically).")
+                return
+            pad = pygame.joystick.Joystick(0)
+            pad.init()
+            self.gamepad = pad
+            try:
+                self.gamepad_instance_id = pad.get_instance_id()
+            except Exception:      # noqa: BLE001 - older pygame
+                self.gamepad_instance_id = None
+            self.gamepad_home_was_pressed = False
+            self.gamepad_play_was_pressed = False
+            self._gamepad_set_status(
+                f"Connected: {pad.get_name()}  "
+                f"({pad.get_numaxes()} axes, {pad.get_numbuttons()} buttons).  "
+                f"Y = home, X = play {PLAYBACK_RECORDING}, LB/RB = gripper.", True)
+        except pygame.error as exc:
+            self._gamepad_drop(f"Gamepad could not be opened: {exc}")
+
+    def _gamepad_service(self):
+        """One iteration of gamepad housekeeping: honour a rescan request,
+        react to hotplug, and poll. Returns (axes, buttons) or (None, None).
+
+        Every pygame call in the app funnels through here, on one thread, and
+        the whole thing is exception-guarded: a pad yanked mid-poll must
+        degrade to 'no gamepad', never take the sim loop down with it.
+        """
+        try:
+            if self.gamepad_rescan_request.is_set():
+                self.gamepad_rescan_request.clear()
+                # A rescan on a working pad should be a no-op from the
+                # operator's point of view, so remember whether teleop was
+                # enabled and put it back if a pad is still there afterwards.
+                # Dropping it silently is how pressing Connect on an already-
+                # connected pad used to leave teleop dead.
+                was_enabled = self.gamepad_enabled
+                # Full subsystem cycle picks up a pad that moved to a
+                # different USB port, which get_count() alone will not.
+                if self.gamepad is not None:
+                    self._gamepad_drop("Rescanning...")
+                pygame.joystick.quit()
+                pygame.joystick.init()
+                self._gamepad_open_first()
+                if was_enabled and self.gamepad is not None:
+                    def restore():
+                        self.gamepad_var.set(True)
+                        self.gamepad_enabled = True
+                    self.root.after(0, restore)
+
+            pygame.event.pump()
+            for ev in pygame.event.get([pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED]):
+                if ev.type == pygame.JOYDEVICEREMOVED:
+                    if (self.gamepad is not None
+                            and (self.gamepad_instance_id is None
+                                 or ev.instance_id == self.gamepad_instance_id)):
+                        self._gamepad_drop("Gamepad unplugged.")
+                elif ev.type == pygame.JOYDEVICEADDED and self.gamepad is None:
+                    self._gamepad_open_first()
+
+            # Fallback for setups where the hotplug events never arrive:
+            # while there is no pad, look again every couple of seconds so a
+            # replug recovers on its own rather than needing the button.
+            if self.gamepad is None:
+                now = time.monotonic()
+                if now >= self._gamepad_next_scan:
+                    self._gamepad_next_scan = now + GAMEPAD_RESCAN_SECONDS
+                    if pygame.joystick.get_count() > 0:
+                        self._gamepad_open_first()
+                return None, None
+
+            axes = [self.gamepad.get_axis(i) for i in range(self.gamepad.get_numaxes())]
+            buttons = [self.gamepad.get_button(i) for i in range(self.gamepad.get_numbuttons())]
+            with self.lock:
+                self.gamepad_axes_snapshot = axes
+                self.gamepad_buttons_snapshot = buttons
+            return axes, buttons
+        except pygame.error as exc:
+            # Almost always "Joystick not initialized" from a pad that
+            # vanished between the check and the read.
+            self._gamepad_drop(f"Gamepad disconnected ({exc}).")
+            return None, None
+        except Exception as exc:   # noqa: BLE001 - see docstring
+            self._gamepad_drop(f"Gamepad error: {type(exc).__name__}: {exc}")
+            return None, None
 
     def _tune_selected_ids(self):
         """Which motor IDs the tuning panel currently targets."""
@@ -1581,6 +1720,23 @@ class DigitalTwinApp:
     def _set_record_status(self, text):
         self.root.after(0, lambda: self.record_status_var.set(text))
 
+    def _set_home_status(self, text):
+        self.root.after(0, lambda: self.home_status_var.set(text))
+
+    def _set_pickplace_status(self, text):
+        self.root.after(0, lambda: self.pickplace_status_var.set(text))
+
+    def _cancel_mirror_from_worker(self, note):
+        """Turn mirror off from a worker thread. mirror_var is a Tk variable,
+        so setting it must be marshalled onto the Tk thread like every other
+        widget touch here; mirror_mode is a plain attribute the loops read, so
+        it is set directly and immediately."""
+        self.mirror_mode = False
+        def apply():
+            self.mirror_var.set(False)
+            self.mirror_note_var.set(note)
+        self.root.after(0, apply)
+
     def _set_teach_mode_controls(self, active: bool):
         """Record and Play both need exclusive control of the hardware
         write path - anything else that can command the arm (mirror,
@@ -1609,9 +1765,21 @@ class DigitalTwinApp:
             # before the mode switch shouldn't keep nudging it mid-capture.
             self.cartesian_jog_var.set(False)
             self.cartesian_jog_enabled = False
-        if active and self.gamepad_enabled:
-            self.gamepad_var.set(False)
-            self.gamepad_enabled = False
+        # The gamepad is suspended for the same reason - a stick nudging the
+        # target would fight the ramp - but suspending it used to be one-way,
+        # so a single Home Position left the pad dead until it was re-ticked
+        # by hand. Remember the state on the way in and put it back on the way
+        # out, but only if the pad is still actually there.
+        if active:
+            if self.gamepad_enabled:
+                self._gamepad_enabled_before_lock = True
+                self.gamepad_var.set(False)
+                self.gamepad_enabled = False
+        elif self._gamepad_enabled_before_lock:
+            self._gamepad_enabled_before_lock = False
+            if self.gamepad is not None:
+                self.gamepad_var.set(True)
+                self.gamepad_enabled = True
 
     def on_toggle_record(self):
         if self.playing or self.homing:
@@ -1645,6 +1813,7 @@ class DigitalTwinApp:
             self._set_teach_mode_controls(True)
             with self.lock:
                 self.frames = []
+                self.loaded_recording_path = None    # this take is not from a file
                 self.record_started_at = time.time()
                 self.recording = True
             self.record_btn.config(text="■ Stop Recording")
@@ -1674,6 +1843,30 @@ class DigitalTwinApp:
             return
         self.stop_playback.clear()
         threading.Thread(target=self._playback_worker, daemon=True).start()
+
+    def on_gamepad_play_recording(self):
+        """Gamepad X: play PLAYBACK_RECORDING. Pressing X again while it runs
+        stops it, matching the on-screen Play/Stop button.
+
+        Loads the file only when it is not already the loaded recording, so
+        repeated presses replay from memory instead of re-reading the disk
+        every time. That does mean X will replace an unsaved hand-taught
+        recording - the same thing the panel's own Load button does, and the
+        status line says which file it switched to."""
+        if self.recording or self.homing:
+            return
+        if self.playing:
+            self.stop_playback.set()
+            return
+        path = os.path.join(RECORDINGS_DIR, PLAYBACK_RECORDING)
+        if self.loaded_recording_path != path:
+            if not os.path.isfile(path):
+                self._set_record_status(
+                    f"Gamepad X: {PLAYBACK_RECORDING} not found in {RECORDINGS_DIR}.")
+                return
+            if not self.load_recording_from(path):
+                return
+        self.on_toggle_play()
 
     def _playback_worker(self):
         self.playing = True
@@ -1750,6 +1943,7 @@ class DigitalTwinApp:
             return
         with self.lock:
             self.frames = []
+            self.loaded_recording_path = None
         self._refresh_playback_buttons()
         self._set_record_status("Recording cleared.")
 
@@ -1806,6 +2000,7 @@ class DigitalTwinApp:
             return False
         with self.lock:
             self.frames = frames
+            self.loaded_recording_path = path
         self._refresh_playback_buttons()
         self._set_record_status(
             f"Loaded {len(frames)} frames ({frames[-1][0]:.1f} s) from {os.path.basename(path)}")
@@ -1992,121 +2187,136 @@ class DigitalTwinApp:
                       if OPTS.viewer else _NullViewer(self.stop_event))
         with viewer_ctx as viewer:
             while viewer.is_running() and not self.stop_event.is_set():
-                # Integrate jog motion against the WALL CLOCK rather than the
-                # sim timestep: the loop assumed 2.0 ms per iteration while
-                # actually taking 2.3-2.5 ms, so every jog ran at only 81-88%
-                # of its commanded speed and drifted with system load.
-                now = time.perf_counter()
-                elapsed = min(now - last_t, 0.05)  # cap, so a stall can't fling the arm
-                last_t = now
+                # A dead sim thread stops jog, target integration and all
+                # motion while the UI happily reports everything as fine -
+                # exactly the failure mode the old gamepad race produced, and
+                # one that took a reboot to notice. Nothing in here is worth
+                # losing the loop over, so log and carry on. The sleep below
+                # stays outside the guard so a persistent fault paces itself
+                # instead of spinning a core.
+                try:
+                    # Integrate jog motion against the WALL CLOCK rather than the
+                    # sim timestep: the loop assumed 2.0 ms per iteration while
+                    # actually taking 2.3-2.5 ms, so every jog ran at only 81-88%
+                    # of its commanded speed and drifted with system load.
+                    now = time.perf_counter()
+                    elapsed = min(now - last_t, 0.05)  # cap, so a stall can't fling the arm
+                    last_t = now
 
-                # --- Workspace-sphere click pick ----------------------------
-                # MuJoCo's viewer handles body selection/dragging internally
-                # (ctrl+double-click-drag is its convention - see the
-                # viewer's own on-screen help for the exact gesture) and
-                # exposes what's selected via viewer.perturb; it does NOT
-                # apply that as a physical force in passive mode unless we
-                # ask it to, so reading it here is purely a coordinate pick,
-                # not a real interaction with the arm.
-                pick_tick_accum += elapsed
-                if pick_tick_accum >= pick_period:
-                    pick_tick_accum = 0.0
-                    if (viewer.perturb.select == self.workspace_body_id
-                            and viewer.perturb.active
-                            & (mujoco.mjtPertBit.mjPERT_TRANSLATE | mujoco.mjtPertBit.mjPERT_ROTATE)):
-                        xmat = self.data.xmat[self.workspace_body_id].reshape(3, 3)
-                        xpos = self.data.xpos[self.workspace_body_id]
-                        world_pt = xpos + xmat @ viewer.perturb.localpos
-                        self.root.after(0, lambda p=np.copy(world_pt): self._on_workspace_pick(p))
+                    # --- Workspace-sphere click pick ----------------------------
+                    # MuJoCo's viewer handles body selection/dragging internally
+                    # (ctrl+double-click-drag is its convention - see the
+                    # viewer's own on-screen help for the exact gesture) and
+                    # exposes what's selected via viewer.perturb; it does NOT
+                    # apply that as a physical force in passive mode unless we
+                    # ask it to, so reading it here is purely a coordinate pick,
+                    # not a real interaction with the arm.
+                    pick_tick_accum += elapsed
+                    if pick_tick_accum >= pick_period:
+                        pick_tick_accum = 0.0
+                        if (viewer.perturb.select == self.workspace_body_id
+                                and viewer.perturb.active
+                                & (mujoco.mjtPertBit.mjPERT_TRANSLATE | mujoco.mjtPertBit.mjPERT_ROTATE)):
+                            xmat = self.data.xmat[self.workspace_body_id].reshape(3, 3)
+                            xpos = self.data.xpos[self.workspace_body_id]
+                            world_pt = xpos + xmat @ viewer.perturb.localpos
+                            self.root.after(0, lambda p=np.copy(world_pt): self._on_workspace_pick(p))
 
-                # --- Gamepad poll --------------------------------------------
-                # pygame calls happen outside self.lock (unrelated to what it
-                # protects); only the resulting target mutation below needs it.
-                gp_axes = gp_buttons = None
-                if self.gamepad is not None:
-                    pygame.event.pump()
-                    gp_axes = [self.gamepad.get_axis(i) for i in range(self.gamepad.get_numaxes())]
-                    gp_buttons = [self.gamepad.get_button(i) for i in range(self.gamepad.get_numbuttons())]
+                    # --- Gamepad: rescan, hotplug and poll ------------------------
+                    # All pygame access lives in _gamepad_service, on this thread
+                    # only, and cannot raise out of it.
+                    gp_axes, gp_buttons = self._gamepad_service()
+
+                    # --- Gamepad buttons -> Home / Play --------------------------
+                    # Edge-triggered, so holding a button fires once instead of
+                    # re-triggering every frame. Dispatched through root.after like
+                    # every other cross-thread call here, and deliberately OUTSIDE
+                    # self.lock: the workers take that lock themselves, so
+                    # triggering while holding it would make the new thread wait on
+                    # a lock this loop still owns. Both handlers apply the same
+                    # record/play/homing guards as their on-screen buttons.
+                    if gp_buttons is None:
+                        self.gamepad_home_was_pressed = False
+                        self.gamepad_play_was_pressed = False
+                    else:
+                        home_pressed = bool(len(gp_buttons) > GAMEPAD_BTN_HOME
+                                            and gp_buttons[GAMEPAD_BTN_HOME])
+                        if (home_pressed and not self.gamepad_home_was_pressed
+                                and self.gamepad_enabled):
+                            self.root.after(0, self.on_go_home)
+                        self.gamepad_home_was_pressed = home_pressed
+
+                        play_pressed = bool(len(gp_buttons) > GAMEPAD_BTN_PLAY
+                                            and gp_buttons[GAMEPAD_BTN_PLAY])
+                        if (play_pressed and not self.gamepad_play_was_pressed
+                                and self.gamepad_enabled):
+                            self.root.after(0, self.on_gamepad_play_recording)
+                        self.gamepad_play_was_pressed = play_pressed
+
                     with self.lock:
-                        self.gamepad_axes_snapshot = gp_axes
-                        self.gamepad_buttons_snapshot = gp_buttons
+                        jog_allowed = not self.mirror_mode and not self.recording and not self.playing and not self.homing
+                        if self.keys_held and jog_allowed:
+                            if self.cartesian_jog_enabled:
+                                delta = np.zeros(3)
+                                for key in self.keys_held:
+                                    if key in CARTESIAN_KEY_BINDINGS:
+                                        axis, direction = CARTESIAN_KEY_BINDINGS[key]
+                                        delta[axis] += direction * CARTESIAN_JOG_RATE * elapsed
+                                if np.any(delta):
+                                    self.target[:4] = self.cartesian_jog_step(self.target[:4].copy(), delta)
+                            else:
+                                for key in self.keys_held:
+                                    if key in KEY_BINDINGS:
+                                        ctrl_idx, direction = KEY_BINDINGS[key]
+                                        lo, hi = self.joint_limits[ctrl_idx]
+                                        self.target[ctrl_idx] += direction * JOINT_SPEED[ctrl_idx] * elapsed
+                                        self.target[ctrl_idx] = max(lo, min(hi, self.target[ctrl_idx]))
 
-                # --- Gamepad Y -> Home position ------------------------------
-                # Edge-triggered, so holding Y fires once instead of restarting
-                # the 2.5s ramp every frame. Dispatched through root.after like
-                # every other cross-thread call here, and deliberately OUTSIDE
-                # self.lock: _go_home_worker takes that lock itself, so
-                # triggering while holding it would make the new thread wait on
-                # a lock this loop still owns. on_go_home() applies the same
-                # record/play/homing guard as the Home button.
-                if gp_buttons is None:
-                    self.gamepad_home_was_pressed = False
-                else:
-                    home_pressed = bool(len(gp_buttons) > GAMEPAD_BTN_HOME
-                                        and gp_buttons[GAMEPAD_BTN_HOME])
-                    if (home_pressed and not self.gamepad_home_was_pressed
-                            and self.gamepad_enabled):
-                        self.root.after(0, self.on_go_home)
-                    self.gamepad_home_was_pressed = home_pressed
-
-                with self.lock:
-                    jog_allowed = not self.mirror_mode and not self.recording and not self.playing and not self.homing
-                    if self.keys_held and jog_allowed:
-                        if self.cartesian_jog_enabled:
-                            delta = np.zeros(3)
-                            for key in self.keys_held:
-                                if key in CARTESIAN_KEY_BINDINGS:
-                                    axis, direction = CARTESIAN_KEY_BINDINGS[key]
-                                    delta[axis] += direction * CARTESIAN_JOG_RATE * elapsed
-                            if np.any(delta):
-                                self.target[:4] = self.cartesian_jog_step(self.target[:4].copy(), delta)
-                        else:
-                            for key in self.keys_held:
-                                if key in KEY_BINDINGS:
-                                    ctrl_idx, direction = KEY_BINDINGS[key]
+                        if self.gamepad_enabled and gp_axes is not None and jog_allowed:
+                            lx = gamepad_axis(gp_axes,GAMEPAD_AXIS_LEFT_X)
+                            ly = gamepad_axis(gp_axes,GAMEPAD_AXIS_LEFT_Y)
+                            rx = gamepad_axis(gp_axes,GAMEPAD_AXIS_RIGHT_X)
+                            ry = gamepad_axis(gp_axes,GAMEPAD_AXIS_RIGHT_Y)
+                            if self.cartesian_jog_enabled:
+                                # Left stick = horizontal plane (X/Y), right stick
+                                # vertical (Z) - stick "up" (negative raw axis) is
+                                # +X / +Z, matching typical flight-stick intuition.
+                                delta = np.array([-ly, lx, -ry]) * CARTESIAN_JOG_RATE * elapsed
+                                if np.any(delta):
+                                    self.target[:4] = self.cartesian_jog_step(self.target[:4].copy(), delta)
+                            else:
+                                for ctrl_idx, stick_val in ((0, -lx), (1, -ly), (2, -ry), (3, rx)):
+                                    if stick_val == 0.0:
+                                        continue
                                     lo, hi = self.joint_limits[ctrl_idx]
-                                    self.target[ctrl_idx] += direction * JOINT_SPEED[ctrl_idx] * elapsed
+                                    self.target[ctrl_idx] += stick_val * GAMEPAD_JOINT_RATE * elapsed
                                     self.target[ctrl_idx] = max(lo, min(hi, self.target[ctrl_idx]))
+                            gripper_dir = 0
+                            if gp_buttons and len(gp_buttons) > GAMEPAD_BTN_GRIPPER_CLOSE and gp_buttons[GAMEPAD_BTN_GRIPPER_CLOSE]:
+                                gripper_dir -= 1
+                            if gp_buttons and len(gp_buttons) > GAMEPAD_BTN_GRIPPER_OPEN and gp_buttons[GAMEPAD_BTN_GRIPPER_OPEN]:
+                                gripper_dir += 1
+                            if gripper_dir:
+                                lo, hi = self.joint_limits[4]
+                                self.target[4] += gripper_dir * GAMEPAD_GRIPPER_RATE * elapsed
+                                self.target[4] = max(lo, min(hi, self.target[4]))
 
-                    if self.gamepad_enabled and gp_axes is not None and jog_allowed:
-                        lx = gamepad_axis(gp_axes,GAMEPAD_AXIS_LEFT_X)
-                        ly = gamepad_axis(gp_axes,GAMEPAD_AXIS_LEFT_Y)
-                        rx = gamepad_axis(gp_axes,GAMEPAD_AXIS_RIGHT_X)
-                        ry = gamepad_axis(gp_axes,GAMEPAD_AXIS_RIGHT_Y)
-                        if self.cartesian_jog_enabled:
-                            # Left stick = horizontal plane (X/Y), right stick
-                            # vertical (Z) - stick "up" (negative raw axis) is
-                            # +X / +Z, matching typical flight-stick intuition.
-                            delta = np.array([-ly, lx, -ry]) * CARTESIAN_JOG_RATE * elapsed
-                            if np.any(delta):
-                                self.target[:4] = self.cartesian_jog_step(self.target[:4].copy(), delta)
-                        else:
-                            for ctrl_idx, stick_val in ((0, -lx), (1, -ly), (2, -ry), (3, rx)):
-                                if stick_val == 0.0:
-                                    continue
-                                lo, hi = self.joint_limits[ctrl_idx]
-                                self.target[ctrl_idx] += stick_val * GAMEPAD_JOINT_RATE * elapsed
-                                self.target[ctrl_idx] = max(lo, min(hi, self.target[ctrl_idx]))
-                        gripper_dir = 0
-                        if gp_buttons and len(gp_buttons) > GAMEPAD_BTN_GRIPPER_CLOSE and gp_buttons[GAMEPAD_BTN_GRIPPER_CLOSE]:
-                            gripper_dir -= 1
-                        if gp_buttons and len(gp_buttons) > GAMEPAD_BTN_GRIPPER_OPEN and gp_buttons[GAMEPAD_BTN_GRIPPER_OPEN]:
-                            gripper_dir += 1
-                        if gripper_dir:
-                            lo, hi = self.joint_limits[4]
-                            self.target[4] += gripper_dir * GAMEPAD_GRIPPER_RATE * elapsed
-                            self.target[4] = max(lo, min(hi, self.target[4]))
+                        # gripper_right_joint mirrors gripper_left_joint (the URDF's
+                        # <mimic> tag is dropped by MuJoCo's URDF importer, so this
+                        # has to be enforced manually every tick).
+                        self.target[5] = self.target[4]
+                        target_snapshot = np.copy(self.target)
 
-                    # gripper_right_joint mirrors gripper_left_joint (the URDF's
-                    # <mimic> tag is dropped by MuJoCo's URDF importer, so this
-                    # has to be enforced manually every tick).
-                    self.target[5] = self.target[4]
-                    target_snapshot = np.copy(self.target)
-
-                clipped = np.clip(target_snapshot, self.model.jnt_range[:6, 0], self.model.jnt_range[:6, 1])
-                self.data.ctrl[:6] = clipped
-                mujoco.mj_step(self.model, self.data)
-                viewer.sync()
+                    clipped = np.clip(target_snapshot, self.model.jnt_range[:6, 0], self.model.jnt_range[:6, 1])
+                    self.data.ctrl[:6] = clipped
+                    mujoco.mj_step(self.model, self.data)
+                    viewer.sync()
+                except Exception:      # noqa: BLE001 - see comment above
+                    self._sim_errors += 1
+                    if self._sim_errors <= 3 or self._sim_errors % 500 == 0:
+                        print('[sim] iteration %d failed:' % self._sim_errors,
+                              flush=True)
+                        traceback.print_exc()
 
                 time.sleep(dt)
 
@@ -2124,54 +2334,69 @@ class DigitalTwinApp:
         last_err = time.perf_counter()
 
         while not self.stop_event.is_set():
+            # Same reasoning as the guard in _sim_loop: if this thread dies,
+            # goal writes and feedback stop while the UI still shows the arm
+            # as connected. A yanked U2D2 raises out of pyserial mid-read,
+            # which is exactly how that used to happen. Log, drop the
+            # connection so the UI tells the truth, and keep the loop alive.
+            # Outside the guard: the pacing code below uses it, so an early
+            # failure must not leave it undefined and raise past the except.
             cycle_start = time.perf_counter()
+            try:
+                # `calibrating` holds io_lock for its whole sweep; skipping here
+                # keeps this thread from queueing up behind it.
+                if self.hw.connected and not self.calibrating:
+                    ticks = self.hw.read_all_ticks_fast()
+                    if ticks:
+                        complete = all(i in ticks for i in DXL_IDS)
+                        with self.lock:
+                            self.present_ticks = ticks
+                            # Mirror mode and recording both make the physical
+                            # arm the source of truth: it drives the twin's
+                            # targets rather than the reverse.
+                            if (self.mirror_mode or self.recording) and complete:
+                                self._sync_targets_from_ticks_locked(ticks)
+                                if self.recording:
+                                    stamp = time.time() - self.record_started_at
+                                    pose = np.copy(self.target)
+                                    # Only keep frames where something actually
+                                    # moved, so holding still doesn't bloat it.
+                                    if (not self.frames or
+                                            np.max(np.abs(pose - self.frames[-1][1])) > RECORD_MIN_DELTA):
+                                        self.frames.append((stamp, pose))
 
-            # `calibrating` holds io_lock for its whole sweep; skipping here
-            # keeps this thread from queueing up behind it.
-            if self.hw.connected and not self.calibrating:
-                ticks = self.hw.read_all_ticks_fast()
-                if ticks:
-                    complete = all(i in ticks for i in DXL_IDS)
-                    with self.lock:
-                        self.present_ticks = ticks
-                        # Mirror mode and recording both make the physical
-                        # arm the source of truth: it drives the twin's
-                        # targets rather than the reverse.
-                        if (self.mirror_mode or self.recording) and complete:
-                            self._sync_targets_from_ticks_locked(ticks)
-                            if self.recording:
-                                stamp = time.time() - self.record_started_at
-                                pose = np.copy(self.target)
-                                # Only keep frames where something actually
-                                # moved, so holding still doesn't bloat it.
-                                if (not self.frames or
-                                        np.max(np.abs(pose - self.frames[-1][1])) > RECORD_MIN_DELTA):
-                                    self.frames.append((stamp, pose))
+                    # Don't write goals in mirror/record (the robot is driving
+                    # the twin there - writing back would fight the operator).
+                    if (self.hw.torque_on and not self.mirror_mode and not self.recording):
+                        with self.lock:
+                            snapshot = np.copy(self.target)
+                        clipped = np.clip(snapshot, self.model.jnt_range[:6, 0], self.model.jnt_range[:6, 1])
+                        id_to_tick = {}
+                        for label, ctrl_idx, dxl_id, lo, hi, kind in JOINT_SPECS:
+                            val = clipped[ctrl_idx]
+                            if kind == "gripper":
+                                id_to_tick[dxl_id] = gripper_to_tick(
+                                    val, lo, hi, self.gripper_tick_at_lo, self.gripper_tick_at_hi)
+                            else:
+                                id_to_tick[dxl_id] = rad_to_tick(val)
+                        self.hw.sync_write_ticks(id_to_tick)
 
-                # Don't write goals in mirror/record (the robot is driving
-                # the twin there - writing back would fight the operator).
-                if (self.hw.torque_on and not self.mirror_mode and not self.recording):
-                    with self.lock:
-                        snapshot = np.copy(self.target)
-                    clipped = np.clip(snapshot, self.model.jnt_range[:6, 0], self.model.jnt_range[:6, 1])
-                    id_to_tick = {}
-                    for label, ctrl_idx, dxl_id, lo, hi, kind in JOINT_SPECS:
-                        val = clipped[ctrl_idx]
-                        if kind == "gripper":
-                            id_to_tick[dxl_id] = gripper_to_tick(
-                                val, lo, hi, self.gripper_tick_at_lo, self.gripper_tick_at_hi)
-                        else:
-                            id_to_tick[dxl_id] = rad_to_tick(val)
-                    self.hw.sync_write_ticks(id_to_tick)
+                    if time.perf_counter() - last_err >= err_period:
+                        last_err = time.perf_counter()
+                        for dxl_id, err_byte in self.hw.check_hardware_errors().items():
+                            desc = decode_hw_error(err_byte)
+                            self.set_status(f"ID {dxl_id} hardware error: {desc} - auto-recovering...")
+                            self.hw.recover(dxl_id)
+                            self.set_status(f"ID {dxl_id} recovered from {desc}")
 
-                if time.perf_counter() - last_err >= err_period:
-                    last_err = time.perf_counter()
-                    for dxl_id, err_byte in self.hw.check_hardware_errors().items():
-                        desc = decode_hw_error(err_byte)
-                        self.set_status(f"ID {dxl_id} hardware error: {desc} - auto-recovering...")
-                        self.hw.recover(dxl_id)
-                        self.set_status(f"ID {dxl_id} recovered from {desc}")
-
+            except Exception:      # noqa: BLE001 - see comment above
+                self._hw_errors += 1
+                if self._hw_errors <= 3 or self._hw_errors % 200 == 0:
+                    print('[hw] iteration %d failed:' % self._hw_errors, flush=True)
+                    traceback.print_exc()
+                if self.hw.connected:
+                    self.hw.connected = False
+                    self.set_status('Lost the arm connection (serial error) - check the U2D2 cable, then press Connect.')
             # Pace by how long the cycle actually took, so bus latency
             # doesn't compound into an ever-slower update rate.
             period = record_period if self.recording else hw_period
