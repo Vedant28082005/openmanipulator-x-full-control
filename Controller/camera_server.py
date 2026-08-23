@@ -34,6 +34,10 @@ PORT = int(os.environ.get("OMX_CAM_PORT", "8091"))
 WIDTH = int(os.environ.get("OMX_CAM_WIDTH", "1280"))
 HEIGHT = int(os.environ.get("OMX_CAM_HEIGHT", "720"))
 RETRY_SECONDS = float(os.environ.get("OMX_CAM_RETRY", "10"))
+# How long the sensor keeps running after the last viewer leaves. Long enough
+# that a page reload or a tab switch does not tear the pipeline down and pay
+# the ~1s restart cost again; short enough that walking away stops the drain.
+IDLE_LINGER_SECONDS = float(os.environ.get("OMX_CAM_LINGER", "10"))
 # The sensor happily produces 30 fps, but that is ~7 Mbit/s of MJPEG - far
 # too much to push through a phone tunnel. Cap it; a viewer can ask for
 # more with ?fps=N when watching over the LAN.
@@ -65,16 +69,53 @@ class FrameBuffer:
 class CameraWorker(threading.Thread):
     """Owns the camera. Any failure is caught, reported, and retried - it must
     never raise out of this thread, or the HTTP server would lose its only
-    source of status information."""
+    source of status information.
+
+    Capture is DEMAND-DRIVEN. The sensor and the MJPEG encoder only run while
+    something is actually watching. Left running unconditionally this process
+    measured ~47% of a core with zero viewers connected - by a wide margin the
+    largest consumer on the Pi, and enough to hold it at its thermal limit for
+    no benefit whatsoever."""
 
     daemon = True
 
     def __init__(self, buffer):
         super().__init__(name="camera")
         self.buffer = buffer
-        self.available = False
+        self.available = False       # a camera exists and could be started
+        self.streaming = False       # the sensor is actually running right now
         self.detail = "starting"
         self._stop = threading.Event()
+        self._demand = threading.Event()   # set while a viewer wants frames
+        self._viewers = 0
+        self._viewer_lock = threading.Lock()
+        self._last_demand = 0.0
+
+    # -- viewer accounting, called from the HTTP threads -------------------
+
+    def add_viewer(self):
+        with self._viewer_lock:
+            self._viewers += 1
+            self._last_demand = time.monotonic()
+            self._demand.set()
+
+    def remove_viewer(self):
+        with self._viewer_lock:
+            self._viewers = max(0, self._viewers - 1)
+            self._last_demand = time.monotonic()
+
+    def poke(self):
+        """A one-off frame request (snapshot). Keeps the sensor alive for the
+        linger window without holding a viewer slot."""
+        with self._viewer_lock:
+            self._last_demand = time.monotonic()
+            self._demand.set()
+
+    def _wanted(self):
+        with self._viewer_lock:
+            if self._viewers > 0:
+                return True
+            return (time.monotonic() - self._last_demand) < IDLE_LINGER_SECONDS
 
     def run(self):
         while not self._stop.is_set():
@@ -95,26 +136,53 @@ class CameraWorker(threading.Thread):
         cams = Picamera2.global_camera_info()
         if not cams:
             self.available = False
+            self.streaming = False
             self.detail = "no camera detected"
             print("[camera] no camera detected; retrying", flush=True)
             return
 
+        model = cams[0].get("Model", "camera")
+        self.available = True
+        self.detail = "%s @ %dx%d (idle)" % (model, WIDTH, HEIGHT)
+
         picam = Picamera2()
         try:
-            config = picam.create_video_configuration(
-                main={"size": (WIDTH, HEIGHT)})
+            config = picam.create_video_configuration(main={"size": (WIDTH, HEIGHT)})
             picam.configure(config)
-            output = FileOutput(_BufferWriter(self.buffer))
-            picam.start_recording(MJPEGEncoder(), output)
-            self.available = True
-            self.detail = "%s @ %dx%d" % (
-                cams[0].get("Model", "camera"), WIDTH, HEIGHT)
-            print("[camera] streaming %s" % self.detail, flush=True)
+
             while not self._stop.is_set():
-                time.sleep(0.5)
-            picam.stop_recording()
+                # Idle: the camera is configured and ready, but the sensor and
+                # encoder are stopped. This is the whole point - running them
+                # with nobody watching measured ~47% of a core and helped hold
+                # the board at its thermal limit.
+                if not self._wanted():
+                    self._demand.clear()
+                    # Wait on the event rather than polling, so an idle camera
+                    # costs one blocked thread and no CPU at all.
+                    self._demand.wait(timeout=1.0)
+                    continue
+
+                output = FileOutput(_BufferWriter(self.buffer))
+                picam.start_recording(MJPEGEncoder(), output)
+                self.streaming = True
+                self.detail = "%s @ %dx%d" % (model, WIDTH, HEIGHT)
+                print("[camera] streaming (viewer connected)", flush=True)
+                try:
+                    while not self._stop.is_set() and self._wanted():
+                        time.sleep(0.25)
+                finally:
+                    picam.stop_recording()
+                    self.streaming = False
+                    self.detail = "%s @ %dx%d (idle)" % (model, WIDTH, HEIGHT)
+                    with self.buffer.condition:
+                        # Wake any reader still blocked on wait_for_frame so it
+                        # notices streaming stopped instead of hanging for its
+                        # full timeout.
+                        self.buffer.condition.notify_all()
+                    print("[camera] idle (no viewers) - sensor stopped", flush=True)
         finally:
             self.available = False
+            self.streaming = False
             try:
                 picam.close()
             except Exception:                      # noqa: BLE001
@@ -164,11 +232,16 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/status", "/"):
             self._json(200, {
                 "available": bool(WORKER and WORKER.available),
+                "streaming": bool(WORKER and WORKER.streaming),
                 "detail": WORKER.detail if WORKER else "not started",
                 "width": WIDTH, "height": HEIGHT,
             })
         elif path == "/snapshot.jpg":
-            frame, _ = FRAMES.wait_for_frame(-1, timeout=5.0)
+            # A single frame still needs the sensor spun up; poke demand and
+            # let the linger window stop it again afterwards.
+            if WORKER:
+                WORKER.poke()
+            frame, _ = FRAMES.wait_for_frame(-1, timeout=6.0)
             if not (WORKER and WORKER.available) or frame is None:
                 self._json(503, {"error": "camera unavailable",
                                  "detail": WORKER.detail if WORKER else ""})
@@ -205,6 +278,9 @@ class Handler(BaseHTTPRequestHandler):
         if not CLIENTS.acquire(blocking=False):
             self._json(503, {"error": "too many viewers"})
             return
+        # Registering here is what actually starts the sensor, and the matching
+        # remove_viewer in the finally block is what lets it stop again.
+        WORKER.add_viewer()
         try:
             self.send_response(200)
             self.send_header("Age", "0")
@@ -236,6 +312,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass                                    # viewer navigated away
         finally:
+            WORKER.remove_viewer()
             CLIENTS.release()
 
 
