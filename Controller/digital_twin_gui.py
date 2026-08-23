@@ -249,6 +249,9 @@ GAMEPAD_BTN_HOME = 3            # Y - go to home position
 GAMEPAD_BTN_PLAY = 2            # X - play PLAYBACK_RECORDING
 GAMEPAD_BTN_ESTOP = 1           # B - torque off (E-STOP)
 GAMEPAD_RESCAN_SECONDS = 2.0    # how often to look for a pad when none is connected
+# Motion-loop rate. Independent of the MuJoCo timestep - see _sim_loop. 100 Hz
+# is 3x the hardware goal-write rate and far beyond human input bandwidth.
+SIM_LOOP_HZ = 100.0
 
 # What the gamepad's X button plays. Kept as a filename resolved against
 # RECORDINGS_DIR rather than an absolute path, so it survives the repo moving.
@@ -2190,6 +2193,20 @@ class DigitalTwinApp:
         hardware traffic now runs on its own thread, see _hw_loop.
         """
         dt = self.model.opt.timestep
+        # The loop USED to sleep dt (2 ms), so it spun ~470 times a second.
+        # Measured, that thread cost 8.7% of a core - of which MuJoCo was 0.3%
+        # and the gamepad poll 0.4%. The other ~8% was simply the Python loop
+        # body running 470 times a second: locks, numpy copies, calls.
+        #
+        # Nothing here needs that rate. Jog integrates against the wall clock
+        # so its speed is unchanged by the loop period, the gamepad is a human
+        # input, and hardware goal writes happen on their own 30 Hz thread.
+        # Running at SIM_LOOP_HZ and catching physics up with as many
+        # fixed-size steps as the elapsed time calls for keeps the twin's
+        # dynamics bit-identical while paying the per-iteration overhead 5x
+        # less often.
+        sim_period = 1.0 / SIM_LOOP_HZ
+        max_steps = max(1, int(round(0.05 / dt)))   # matches the elapsed cap
         self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
         pick_tick_accum = 0.0
         pick_period = 1.0 / 15.0  # workspace-sphere pick poll at 15 Hz
@@ -2349,7 +2366,14 @@ class DigitalTwinApp:
 
                     clipped = np.clip(target_snapshot, self.model.jnt_range[:6, 0], self.model.jnt_range[:6, 1])
                     self.data.ctrl[:6] = clipped
-                    mujoco.mj_step(self.model, self.data)
+                    # Advance sim time by the real time that passed, in the
+                    # model's own fixed timestep, so the twin tracks the wall
+                    # clock exactly as it did when the loop ran at 1 step per
+                    # iteration. Capped by the same 0.05 s ceiling used for
+                    # `elapsed`, so a stall cannot turn into a long catch-up
+                    # burst.
+                    for _ in range(min(max_steps, max(1, int(elapsed / dt)))):
+                        mujoco.mj_step(self.model, self.data)
                     viewer.sync()
                 except Exception:      # noqa: BLE001 - see comment above
                     self._sim_errors += 1
@@ -2358,7 +2382,8 @@ class DigitalTwinApp:
                               flush=True)
                         traceback.print_exc()
 
-                time.sleep(dt)
+                # Pace on the loop period, not the physics timestep.
+                time.sleep(max(0.0, sim_period - (time.perf_counter() - now)))
 
     def _hw_loop(self):
         """All serial traffic, on its own thread at a steady rate.
