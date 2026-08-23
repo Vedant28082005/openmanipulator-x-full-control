@@ -247,6 +247,7 @@ GAMEPAD_BTN_GRIPPER_CLOSE = 4   # LB
 GAMEPAD_BTN_GRIPPER_OPEN = 5    # RB
 GAMEPAD_BTN_HOME = 3            # Y - go to home position
 GAMEPAD_BTN_PLAY = 2            # X - play PLAYBACK_RECORDING
+GAMEPAD_BTN_ESTOP = 1           # B - torque off (E-STOP)
 GAMEPAD_RESCAN_SECONDS = 2.0    # how often to look for a pad when none is connected
 
 # What the gamepad's X button plays. Kept as a filename resolved against
@@ -263,6 +264,8 @@ GAMEPAD_HELP = (
     "LB / RB: gripper close/open   -   Proportional to how far you push (analog).\n"
     "Y: return to home position (same 2.5s eased move as the Home button).\n"
     "X: play the saved " + PLAYBACK_RECORDING + " recording (press again to stop).\n"
+    "B: E-STOP - torque off. Works whenever a pad is attached, even with the\n"
+    "   Enable Gamepad box unticked, and the arm WILL drop when de-energised.\n"
     "Uses the same Cartesian-jog-mode checkbox as the keyboard, above."
 )
 
@@ -727,6 +730,7 @@ class DigitalTwinApp:
         self.gamepad_buttons_snapshot = []
         self.gamepad_home_was_pressed = False
         self.gamepad_play_was_pressed = False
+        self.gamepad_estop_was_pressed = False
 
         # Gamepad ownership: ONLY the sim thread may touch pygame.joystick or
         # the Joystick object. Everything else (the Connect button, the web
@@ -1257,6 +1261,13 @@ class DigitalTwinApp:
     def on_estop(self):
         self.hw.set_torque(False)
 
+    def _gamepad_estop(self):
+        """Gamepad B. Drops torque, then says so - set_torque's own status
+        line reads the same whether a human hit the button or a stick did, and
+        an arm that suddenly goes limp is worth attributing."""
+        self.on_estop()
+        self.set_status("E-STOP from gamepad (B) - torque off, the arm is limp.")
+
     def on_go_home(self):
         if self.recording or self.playing or self.homing:
             return
@@ -1536,6 +1547,7 @@ class DigitalTwinApp:
         self.gamepad_instance_id = None
         self.gamepad_home_was_pressed = False
         self.gamepad_play_was_pressed = False
+        self.gamepad_estop_was_pressed = False
         with self.lock:
             self.gamepad_axes_snapshot = []
             self.gamepad_buttons_snapshot = []
@@ -1557,6 +1569,7 @@ class DigitalTwinApp:
                 self.gamepad_instance_id = None
             self.gamepad_home_was_pressed = False
             self.gamepad_play_was_pressed = False
+            self.gamepad_estop_was_pressed = False
             self._gamepad_set_status(
                 f"Connected: {pad.get_name()}  "
                 f"({pad.get_numaxes()} axes, {pad.get_numbuttons()} buttons).  "
@@ -2238,6 +2251,7 @@ class DigitalTwinApp:
                     if gp_buttons is None:
                         self.gamepad_home_was_pressed = False
                         self.gamepad_play_was_pressed = False
+                        self.gamepad_estop_was_pressed = False
                     else:
                         home_pressed = bool(len(gp_buttons) > GAMEPAD_BTN_HOME
                                             and gp_buttons[GAMEPAD_BTN_HOME])
@@ -2252,6 +2266,32 @@ class DigitalTwinApp:
                                 and self.gamepad_enabled):
                             self.root.after(0, self.on_gamepad_play_recording)
                         self.gamepad_play_was_pressed = play_pressed
+
+                        # B -> E-STOP. Deliberately unlike the two above:
+                        #
+                        #  * NOT gated on gamepad_enabled. This file's rule is
+                        #    that E-STOP is always reachable - the on-screen one
+                        #    is never disabled either. A pad you can hold is a
+                        #    pad whose panic button should work, and having to
+                        #    tick a checkbox first defeats the point.
+                        #
+                        #  * NOT dispatched through root.after. Every other
+                        #    cross-thread call here queues on the Tk loop, but an
+                        #    E-STOP must not wait behind whatever that thread is
+                        #    doing - mid-home-ramp it is busy pushing widget
+                        #    updates. Its own thread, exactly as the web panel's
+                        #    E-STOP already does. on_estop only flips torque via
+                        #    the hardware lock and touches no widget.
+                        #
+                        # Still edge-triggered: set_torque writes to all five
+                        # motors, and re-sending that 30x/second while the button
+                        # is held would flood the bus for no benefit.
+                        estop_pressed = bool(len(gp_buttons) > GAMEPAD_BTN_ESTOP
+                                             and gp_buttons[GAMEPAD_BTN_ESTOP])
+                        if estop_pressed and not self.gamepad_estop_was_pressed:
+                            threading.Thread(target=self._gamepad_estop,
+                                             daemon=True).start()
+                        self.gamepad_estop_was_pressed = estop_pressed
 
                     with self.lock:
                         jog_allowed = not self.mirror_mode and not self.recording and not self.playing and not self.homing

@@ -950,7 +950,7 @@ PAGE_BODY = """
 
     <div class="card">
       <h2>Gamepad Teleop</h2>
-      <p class="hint">A pad plugged into the host machine, not the phone. Left stick base/shoulder, right stick wrist/elbow, LB/RB gripper. <b>Y</b> homes the arm, <b>X</b> plays the saved recording. Plugging a pad in is detected automatically — Rescan is only needed if that misses it.</p>
+      <p class="hint">A pad plugged into the host machine, not the phone. Left stick base/shoulder, right stick wrist/elbow, LB/RB gripper. <b>Y</b> homes the arm, <b>X</b> plays the saved recording, <b>B</b> is E-STOP (torque off — works even with the toggle below off; the arm drops when de-energised). Plugging a pad in is detected automatically — Rescan is only needed if that misses it.</p>
       <button class="btn" id="gp-connect" style="margin-bottom:8px">Rescan for Gamepad</button>
       <div class="tog">
         <div><div class="t">Enable gamepad</div><div class="s">Uses the Cartesian mode toggle above.</div></div>
