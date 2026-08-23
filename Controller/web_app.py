@@ -467,7 +467,20 @@ class _Handler(BaseHTTPRequestHandler):
             return
         path = self.path.split("?", 1)[0]
         if path == "/":
-            self._send(200, PAGE_HTML, "text/html; charset=utf-8",
+            # Landing page: pick a role. Deliberately unauthenticated - it is
+            # a menu, and the guest half is meant to be reachable without a
+            # password. Nothing here reads or touches robot state.
+            self._send(200, LANDING_HTML, "text/html; charset=utf-8",
+                       set_token_cookie=WEB_TOKEN and "token=" in self.path)
+        elif path in ("/view", "/control"):
+            # The SAME panel either way. The role only drives what the UI
+            # offers; it is not the security boundary. That boundary is
+            # nginx refusing POST /api/* without controller credentials, so a
+            # guest who edits window.OMX_ROLE in a console gains buttons that
+            # return 401 and nothing else.
+            role = "controller" if path == "/control" else "guest"
+            self._send(200, PAGE_HTML.replace("__OMX_ROLE__", role),
+                       "text/html; charset=utf-8",
                        set_token_cookie=WEB_TOKEN and "token=" in self.path)
         elif path == "/api/state":
             with self.app.web_state_lock:
@@ -770,15 +783,25 @@ nav button.on{color:var(--red)}
 .viewer3d-off.hide{display:none}
 .credit{text-align:center;font-size:11px;color:var(--dim);letter-spacing:.02em;
   padding:4px 0 2px}
+/* Guest mode. Hidden rather than removed from the DOM on purpose: render()
+   and the static wiring both look elements up by id every poll, and deleting
+   them would turn every tick into a null dereference. This is presentation
+   only - the actual boundary is nginx refusing POST /api/* without controller
+   credentials, so unhiding these in devtools buys a guest nothing but 401s. */
+body.guest [data-ctl]{display:none !important}
+.viewbar{background:var(--info);color:#04121f;text-align:center;padding:7px 12px;
+  font-size:12px;font-weight:700;letter-spacing:.02em}
+.viewbar a{color:#04121f;text-decoration:underline}
 """
 
 
 PAGE_BODY = """
+<div class="viewbar" id="viewbar" style="display:none">VIEW ONLY &mdash; you are signed in as a guest. <a href="/control">Sign in to control</a></div>
 <div class="offline" id="offline">CONNECTION TO ROBOT LOST</div>
 <header>
   <div class="hrow">
     <div class="brand">OpenManipulator-X<small>Digital Twin Control</small></div>
-    <button class="estop" id="estop">TORQUE OFF<br>E-STOP</button>
+    <button class="estop" data-ctl id="estop">TORQUE OFF<br>E-STOP</button>
   </div>
   <div class="pills" id="pills"></div>
   <div class="statebar sim" id="statebar">Connecting...</div>
@@ -805,7 +828,7 @@ PAGE_BODY = """
       </div>
       <div class="status" id="s-viewer3d"></div>
     </div>
-    <div class="card">
+    <div class="card" data-ctl>
       <h2>Home</h2>
       <p class="hint">Per-joint sliders were removed from this page - a continuous drag is a bad fit for a link that can lag, and a bigger control surface than a public panel needs. Use Jog for step-wise per-joint moves, Inverse Kinematics for a target position, or teach a Pick &amp; Place under Teach.</p>
       <button class="btn" id="home">Home Position</button>
@@ -814,7 +837,7 @@ PAGE_BODY = """
   </section>
 
   <!-- ============ JOG ============ -->
-  <section class="panel" id="p-jog">
+  <section class="panel" data-ctl id="p-jog">
     <div class="card">
       <h2>Jog</h2>
       <p class="hint">Hold a button to move continuously - release to stop. Mirrors the desktop keyboard jog exactly.</p>
@@ -829,7 +852,7 @@ PAGE_BODY = """
   </section>
 
   <!-- ============ IK ============ -->
-  <section class="panel" id="p-ik">
+  <section class="panel" data-ctl id="p-ik">
     <div class="card">
       <h2>Inverse Kinematics</h2>
       <p class="hint">Type an end-effector target in meters and solve for the joint angles.</p>
@@ -848,7 +871,7 @@ PAGE_BODY = """
   </section>
 
   <!-- ============ TEACH ============ -->
-  <section class="panel" id="p-teach">
+  <section class="panel" data-ctl id="p-teach">
     <div class="card">
       <h2>Teach by Demonstration</h2>
       <p class="hint">Turn torque off, hand-guide the arm, and record its own encoder feedback. Playback runs at the speed you taught it.</p>
@@ -895,7 +918,7 @@ PAGE_BODY = """
 
   <!-- ============ SETUP ============ -->
   <section class="panel" id="p-setup">
-    <div class="card">
+    <div class="card" data-ctl>
       <h2>Hardware</h2>
       <p class="hint">U2D2 /dev/ttyUSB0 @ 1,000,000 bps, protocol 2.0. Nothing moves until torque is enabled.</p>
       <div class="grid g2" style="margin-bottom:8px">
@@ -922,7 +945,7 @@ PAGE_BODY = """
       <div class="status" id="s-mirror"></div>
     </div>
 
-    <div class="card">
+    <div class="card" data-ctl>
       <h2>Position Gain Tuning</h2>
       <p class="hint">Applies live with torque on. Vibrating at rest: lower P in ~200 steps. Stuttering while moving: adjust Vel.</p>
       <label class="f">Joint</label>
@@ -948,7 +971,7 @@ PAGE_BODY = """
       <table><tbody id="hostinfo"></tbody></table>
     </div>
 
-    <div class="card">
+    <div class="card" data-ctl>
       <h2>Gamepad Teleop</h2>
       <p class="hint">A pad plugged into the host machine, not the phone. Left stick base/shoulder, right stick wrist/elbow, LB/RB gripper. <b>Y</b> homes the arm, <b>X</b> plays the saved recording, <b>B</b> is E-STOP (torque off — works even with the toggle below off; the arm drops when de-energised). Plugging a pad in is detected automatically — Rescan is only needed if that misses it.</p>
       <button class="btn" id="gp-connect" style="margin-bottom:8px">Rescan for Gamepad</button>
@@ -964,9 +987,9 @@ PAGE_BODY = """
 
 <nav>
   <button class="on" data-tab="control"><span class="ic">&#9707;</span>Control</button>
-  <button data-tab="jog"><span class="ic">&#10021;</span>Jog</button>
-  <button data-tab="ik"><span class="ic">&#8982;</span>IK</button>
-  <button data-tab="teach"><span class="ic">&#9210;</span>Teach</button>
+  <button data-ctl data-tab="jog"><span class="ic">&#10021;</span>Jog</button>
+  <button data-ctl data-tab="ik"><span class="ic">&#8982;</span>IK</button>
+  <button data-ctl data-tab="teach"><span class="ic">&#9210;</span>Teach</button>
   <button data-tab="setup"><span class="ic">&#9881;</span>Setup</button>
 </nav>
 <div class="toast" id="toast"></div>
@@ -975,6 +998,16 @@ PAGE_BODY = """
 
 PAGE_JS = """
 const $ = id => document.getElementById(id);
+
+/* Role, injected per-request by the server (/view vs /control). Applied as a
+   body class so a stylesheet does the hiding; no element is removed, so every
+   lookup in the rest of this file still resolves. */
+const GUEST = (window.OMX_ROLE === 'guest');
+if(GUEST){
+  document.body.classList.add('guest');
+  const vb = document.getElementById('viewbar');
+  if(vb) vb.style.display = 'block';
+}
 let editing  = null;      // text field currently focused
 let lastOk   = Date.now();
 let CURF     = {};      // newest flags, for handlers that must know the state
@@ -984,14 +1017,42 @@ function toast(msg){
   clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), 1800);
 }
 
+/* How long without a successful poll before we treat the link as dead and stop
+   accepting commands. Two poll periods plus slack. */
+const STALE_MS = 2500;
+const POLL_MS  = 200;
+const REQ_TIMEOUT_MS = 4000;
+
+function linkStale(){ return Date.now() - lastOk > STALE_MS; }
+
 async function post(action, body){
+  /* Refuse to queue commands at a robot we are not currently talking to.
+     A backgrounded or frozen tab used to accumulate presses - the fetches sat
+     unsent, and when the connection came back the arm replayed every button
+     the operator had pressed while staring at a dead screen. Dropping them is
+     the only safe option: a command issued 40 seconds ago against a pose the
+     arm has since left is not one you want executed.
+
+     E-STOP is exempt. If the link is dead it will fail anyway, but a panic
+     button must always be allowed to try. */
+  if(action !== 'estop' && linkStale()){
+    toast('Not connected - command ignored');
+    return null;
+  }
+  /* Every request gets a deadline. Without one a stalled fetch hangs for the
+     browser's own (very long) timeout and then lands late, which is the same
+     replay problem by another route. */
+  const ctl = new AbortController();
+  const timer = setTimeout(()=>ctl.abort(), REQ_TIMEOUT_MS);
   try{
     const r = await fetch('/api/'+action, {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})});
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{}),
+      signal: ctl.signal});
     const j = await r.json();
     if(j && j.ok === false && j.error) toast(j.error);
     return j;
   }catch(e){ return null; }
+  finally{ clearTimeout(timer); }
 }
 
 /* ---------- tabs ---------- */
@@ -1251,15 +1312,47 @@ function render(s){
 }
 
 /* ---------- poll ---------- */
+/* Self-scheduling rather than setInterval. setInterval fires on a fixed
+   cadence whether or not the previous poll finished, so a slow link stacked
+   requests, and a tab that the browser froze woke up and delivered the whole
+   backlog at once - the "everything happens later, all together" behaviour.
+   Chaining the next poll only after the current one settles makes overlap
+   structurally impossible. */
+let tickTimer = null;
+function scheduleTick(ms){
+  clearTimeout(tickTimer);
+  tickTimer = setTimeout(tick, ms);
+}
+
 async function tick(){
+  /* A hidden tab is throttled hard by every mobile browser, so polling it is
+     wasted work on both ends. Stop entirely and resume on the way back; the
+     stale guard then blocks commands for the one round trip it takes to get a
+     fresh state, which is exactly the window in which the UI is still showing
+     the operator something out of date. */
+  if(document.hidden){ scheduleTick(1000); return; }
+
+  const ctl = new AbortController();
+  const timer = setTimeout(()=>ctl.abort(), REQ_TIMEOUT_MS);
   try{
-    const r = await fetch('/api/state', {cache:'no-store'});
+    const r = await fetch('/api/state', {cache:'no-store', signal: ctl.signal});
     const s = await r.json();
     if(!s.error){ render(s); lastOk = Date.now(); }
-  }catch(e){ /* handled by the staleness check below */ }
-  $('offline').classList.toggle('show', Date.now() - lastOk > 2000);
+  }catch(e){ /* surfaced by the staleness check below */ }
+  finally{ clearTimeout(timer); }
+
+  $('offline').classList.toggle('show', linkStale());
+  scheduleTick(POLL_MS);
 }
-setInterval(tick, 200);
+
+document.addEventListener('visibilitychange', ()=>{
+  if(!document.hidden){
+    // Back on screen: resync immediately rather than waiting out the slow
+    // hidden-tab cadence, so controls unblock as soon as possible.
+    scheduleTick(0);
+  }
+});
+
 tick();
 """
 
@@ -1451,6 +1544,86 @@ VIEWER_JS = """
 
 
 
+LANDING_CSS = """
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;min-height:100%;background:#111214;color:#e7e8ea;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  -webkit-text-size-adjust:100%}
+.wrap{min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;padding:24px 18px;gap:26px}
+.brand{text-align:center}
+.brand h1{margin:0;font-size:clamp(20px,5vw,30px);font-weight:700;letter-spacing:.01em}
+.brand p{margin:6px 0 0;font-size:clamp(11px,2.6vw,13px);color:#6b6e76;
+  letter-spacing:.10em;text-transform:uppercase}
+.roles{display:grid;gap:14px;width:100%;max-width:760px;
+  grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.role{background:#1a1b1f;border:1px solid #34363c;border-radius:8px;padding:20px;
+  display:flex;flex-direction:column;gap:10px;text-decoration:none;color:inherit;
+  transition:border-color .15s,background .15s}
+.role h2{margin:0;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:#aeb1b8}
+.role .lead{font-size:clamp(15px,3.4vw,17px);font-weight:600}
+.role ul{margin:2px 0 0;padding-left:18px;font-size:13px;line-height:1.65;color:#9a9da5}
+.role .go{margin-top:auto;padding-top:14px;font-size:13px;font-weight:600}
+.role.view .go{color:#4d8fdb}
+.role.ctl  .go{color:#e2412c}
+.role.ctl{border-color:#4a3130}
+.note{max-width:760px;font-size:12px;line-height:1.6;color:#6b6e76;text-align:center}
+.credit{font-size:11px;color:#6b6e76;letter-spacing:.02em}
+@media (hover:hover) and (pointer:fine){
+  .role:hover{background:#212226;border-color:#4a4d55}
+}
+"""
+
+LANDING_BODY = """
+<div class="wrap">
+  <div class="brand">
+    <h1>OpenManipulator-X</h1>
+    <p>Robot Arm Control</p>
+  </div>
+
+  <div class="roles">
+    <a class="role view" href="/view">
+      <h2>Guest</h2>
+      <div class="lead">View only</div>
+      <ul>
+        <li>Live camera feed</li>
+        <li>3D digital twin</li>
+        <li>Joint positions and motor feedback</li>
+        <li>Pi health: temperature, uptime, rates</li>
+      </ul>
+      <div class="go">Continue as guest &rarr;</div>
+    </a>
+
+    <a class="role ctl" href="/control">
+      <h2>Controller</h2>
+      <div class="lead">Full control</div>
+      <ul>
+        <li>Everything a guest can see</li>
+        <li>Jog, inverse kinematics, gripper</li>
+        <li>Teach, record and play back motions</li>
+        <li>Torque, E-STOP and tuning</li>
+      </ul>
+      <div class="go">Sign in to control &rarr;</div>
+    </a>
+  </div>
+
+  <p class="note">Guests cannot move the arm. Control requires a username and
+  password, and that is enforced by the server &mdash; not by hiding buttons.</p>
+
+  <div class="credit">Built by Dr. Ravi Kant &amp; Vedant Sutariya</div>
+</div>
+"""
+
+LANDING_HTML = ("<!doctype html><html lang=\"en\"><head>"
+                "<meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,"
+                "viewport-fit=cover\">"
+                "<meta name=\"theme-color\" content=\"#111214\">"
+                "<title>OpenManipulator-X</title>"
+                "<style>" + LANDING_CSS + "</style></head><body>"
+                + LANDING_BODY + "</body></html>")
+
+
 PAGE_HTML = ("<!doctype html><html lang=\"en\"><head>"
              "<meta charset=\"utf-8\">"
              "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,"
@@ -1461,6 +1634,7 @@ PAGE_HTML = ("<!doctype html><html lang=\"en\"><head>"
              "<title>OpenManipulator-X</title>"
              "<style>" + PAGE_CSS + "</style></head><body>"
              + PAGE_BODY +
+             "<script>window.OMX_ROLE=\"__OMX_ROLE__\";</script>"
              "<script>" + PAGE_JS + "</script>"
              "<script>" + CAMERA_JS + "</script>"
              "<script>" + VIEWER_JS + "</script></body></html>")
