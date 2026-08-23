@@ -248,6 +248,7 @@ GAMEPAD_BTN_GRIPPER_OPEN = 5    # RB
 GAMEPAD_BTN_HOME = 3            # Y - go to home position
 GAMEPAD_BTN_PLAY = 2            # X - play PLAYBACK_RECORDING
 GAMEPAD_BTN_ESTOP = 1           # B - torque off (E-STOP)
+GAMEPAD_BTN_TORQUE_ON = 0       # A - torque on
 GAMEPAD_RESCAN_SECONDS = 2.0    # how often to look for a pad when none is connected
 # Motion-loop rate. Independent of the MuJoCo timestep - see _sim_loop. 100 Hz
 # is 3x the hardware goal-write rate and far beyond human input bandwidth.
@@ -269,6 +270,9 @@ GAMEPAD_HELP = (
     "X: play the saved " + PLAYBACK_RECORDING + " recording (press again to stop).\n"
     "B: E-STOP - torque off. Works whenever a pad is attached, even with the\n"
     "   Enable Gamepad box unticked, and the arm WILL drop when de-energised.\n"
+    "A: torque ON. Requires Enable Gamepad to be ticked, unlike B - energising\n"
+    "   the arm is the direction that can hurt, so a pad left on a bench must\n"
+    "   not be able to do it. Targets re-sync first, so it does not lunge.\n"
     "Uses the same Cartesian-jog-mode checkbox as the keyboard, above."
 )
 
@@ -734,6 +738,7 @@ class DigitalTwinApp:
         self.gamepad_home_was_pressed = False
         self.gamepad_play_was_pressed = False
         self.gamepad_estop_was_pressed = False
+        self.gamepad_torque_was_pressed = False
 
         # Gamepad ownership: ONLY the sim thread may touch pygame.joystick or
         # the Joystick object. Everything else (the Connect button, the web
@@ -1551,6 +1556,7 @@ class DigitalTwinApp:
         self.gamepad_home_was_pressed = False
         self.gamepad_play_was_pressed = False
         self.gamepad_estop_was_pressed = False
+        self.gamepad_torque_was_pressed = False
         with self.lock:
             self.gamepad_axes_snapshot = []
             self.gamepad_buttons_snapshot = []
@@ -1573,10 +1579,12 @@ class DigitalTwinApp:
             self.gamepad_home_was_pressed = False
             self.gamepad_play_was_pressed = False
             self.gamepad_estop_was_pressed = False
+            self.gamepad_torque_was_pressed = False
             self._gamepad_set_status(
                 f"Connected: {pad.get_name()}  "
                 f"({pad.get_numaxes()} axes, {pad.get_numbuttons()} buttons).  "
-                f"Y = home, X = play {PLAYBACK_RECORDING}, LB/RB = gripper.", True)
+                f"Y = home, X = play {PLAYBACK_RECORDING}, A = torque on, "
+                f"B = E-STOP, LB/RB = gripper.", True)
         except pygame.error as exc:
             self._gamepad_drop(f"Gamepad could not be opened: {exc}")
 
@@ -2269,6 +2277,7 @@ class DigitalTwinApp:
                         self.gamepad_home_was_pressed = False
                         self.gamepad_play_was_pressed = False
                         self.gamepad_estop_was_pressed = False
+                        self.gamepad_torque_was_pressed = False
                     else:
                         home_pressed = bool(len(gp_buttons) > GAMEPAD_BTN_HOME
                                             and gp_buttons[GAMEPAD_BTN_HOME])
@@ -2309,6 +2318,33 @@ class DigitalTwinApp:
                             threading.Thread(target=self._gamepad_estop,
                                              daemon=True).start()
                         self.gamepad_estop_was_pressed = estop_pressed
+
+                        # A -> torque ON. The mirror of B, and deliberately
+                        # NOT its mirror in how it is guarded:
+                        #
+                        #  * B is ungated because de-energising is the safe
+                        #    direction and a panic button must always work.
+                        #    A energises a machine that can move and, on
+                        #    release, drop - so it requires Enable Gamepad,
+                        #    exactly like Y and X. A pad left face-down on a
+                        #    bench must not be able to power up the arm.
+                        #
+                        #  * Dispatched through root.after rather than its own
+                        #    thread. There is no urgency here worth bypassing
+                        #    the event loop for; that exemption exists for
+                        #    E-STOP alone.
+                        #
+                        # on_enable_torque only ever enables - it is not a
+                        # toggle - and re-syncs every target to the arm's
+                        # measured position first, so this cannot lunge. With
+                        # no arm connected it fails safe: the position read
+                        # returns nothing and torque is left off.
+                        torque_pressed = bool(len(gp_buttons) > GAMEPAD_BTN_TORQUE_ON
+                                              and gp_buttons[GAMEPAD_BTN_TORQUE_ON])
+                        if (torque_pressed and not self.gamepad_torque_was_pressed
+                                and self.gamepad_enabled):
+                            self.root.after(0, self.on_enable_torque)
+                        self.gamepad_torque_was_pressed = torque_pressed
 
                     with self.lock:
                         jog_allowed = not self.mirror_mode and not self.recording and not self.playing and not self.homing
