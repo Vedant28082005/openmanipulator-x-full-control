@@ -18,10 +18,13 @@ Anything that mutates `app.target` still goes through `app.lock`, same as the
 keyboard, gamepad and slider paths.
 """
 
+import base64
+import hashlib
 import hmac
 import json
 import os
 import socket
+import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -249,6 +252,20 @@ def _safe_recording_name(name):
     return name
 
 
+def _set_joint(app, idx, value, g):
+    """Apply one joint target, clamped to that joint's limits. Reached only
+    over the websocket now - the old POST-per-slider-input route is gone, and
+    with it the queueing that made dragging a slider on a slow link replay
+    minutes later."""
+    lo, hi = app.joint_limits.get(idx, (-3.15, 3.15))
+    value = max(lo, min(hi, float(value)))
+    for var, label, ctrl_idx, scale in app.scale_vars:
+        if ctrl_idx == idx:
+            var.set(value)      # keeps the desktop slider in step
+            break
+    app._on_slider(idx, value)
+
+
 def perform(app, g, action, body):
     """Run one web action. Returns a small dict; the real feedback the phone
     sees is the next /api/state poll, exactly like the desktop panel's own
@@ -285,6 +302,11 @@ def perform(app, g, action, body):
         tk_call(lambda: app.on_capture_pose(name))
     elif action == "run_pick_place":
         tk_call(app.on_run_pick_place)
+
+    # --- joints -------------------------------------------------------------
+    elif action == "joint":
+        idx, value = int(body["idx"]), float(body["value"])
+        tk_call(lambda: _set_joint(app, idx, value, g))
 
     # --- jogging -----------------------------------------------------------
     elif action == "jog":
@@ -385,10 +407,146 @@ def perform(app, g, action, body):
 # HTTP server
 # --------------------------------------------------------------------------
 
+# ---------------------------------------------------------------- websocket
+#
+# RFC 6455, implemented here rather than pulled in as a dependency because
+# this file is deliberately stdlib-only - see the module docstring. Only the
+# subset the panel needs: a text-frame channel, ping/pong, and a clean close.
+#
+# Why a socket at all, when polling worked: the joint sliders were removed
+# from the panel because POST-per-input queued disastrously on a slow link -
+# the arm replayed the whole drag long after the finger stopped. HTTP gives a
+# client no way to see that backlog building. A socket does: bufferedAmount is
+# exactly "how much have I written that has not gone out yet", so the client
+# can drop stale input instead of queueing it. That is what makes putting the
+# sliders back safe.
+
+# The RFC 6455 magic string. Transposing even one character still
+# produces a plausible-looking base64 accept value, which a hand-rolled
+# test client will happily ignore and every real browser will reject -
+# so this is checked against the spec's own test vector in the suite.
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_BROADCAST_HZ = 20.0          # state pushes per second to each open socket
+WS_PING_SECONDS = 15.0          # keepalive, and how fast a dead peer is noticed
+
+_ws_clients = set()
+_ws_lock = threading.Lock()
+
+
+def _ws_frame(payload: bytes, opcode: int = 0x1) -> bytes:
+    """Server->client frame. Never masked, per the spec."""
+    header = bytearray([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n < (1 << 16):
+        header.append(126)
+        header += struct.pack(">H", n)
+    else:
+        header.append(127)
+        header += struct.pack(">Q", n)
+    return bytes(header) + payload
+
+
+def _ws_read_frame(rfile):
+    """Reads one client frame. Returns (opcode, payload) or (None, None) at
+    end of stream. Client frames are always masked; an unmasked one is a
+    protocol violation and closes the connection."""
+    hdr = rfile.read(2)
+    if not hdr or len(hdr) < 2:
+        return None, None
+    b0, b1 = hdr[0], hdr[1]
+    opcode = b0 & 0x0F
+    masked = bool(b1 & 0x80)
+    n = b1 & 0x7F
+    if n == 126:
+        n = struct.unpack(">H", rfile.read(2))[0]
+    elif n == 127:
+        n = struct.unpack(">Q", rfile.read(8))[0]
+    if n > (1 << 20):           # 1 MB: nothing this protocol sends is close
+        return None, None
+    if not masked:
+        return None, None
+    mask = rfile.read(4)
+    data = bytearray(rfile.read(n))
+    for i in range(n):
+        data[i] ^= mask[i & 3]
+    return opcode, bytes(data)
+
+
+class _WSClient:
+    """One open socket. send() is serialised and never raises upward - a
+    broadcast to a peer that has gone away must not disturb the others."""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.wfile = handler.wfile
+        self.lock = threading.Lock()
+        self.alive = True
+
+    def send(self, payload: bytes, opcode: int = 0x1):
+        if not self.alive:
+            return False
+        with self.lock:
+            try:
+                self.wfile.write(_ws_frame(payload, opcode))
+                self.wfile.flush()
+                return True
+            except (OSError, ValueError):
+                self.alive = False
+                return False
+
+    def close(self):
+        self.alive = False
+        try:
+            self.wfile.write(_ws_frame(b"", 0x8))
+            self.wfile.flush()
+        except Exception:       # noqa: BLE001 - already going away
+            pass
+
+
+def ws_broadcast_loop(app):
+    """Pushes the state snapshot to every open socket. One thread for all of
+    them rather than one per client: the snapshot is built once by the Tk
+    thread anyway, and fanning it out here keeps the cost flat as viewers are
+    added."""
+    period = 1.0 / WS_BROADCAST_HZ
+    last_ping = time.monotonic()
+    while not app.stop_event.is_set():
+        start = time.monotonic()
+        with _ws_lock:
+            clients = list(_ws_clients)
+        if clients:
+            with app.web_state_lock:
+                snapshot = app.web_state
+            try:
+                payload = json.dumps({"t": "state", "s": snapshot}).encode()
+            except (TypeError, ValueError):
+                payload = None
+            if payload is not None:
+                for c in clients:
+                    if not c.send(payload):
+                        with _ws_lock:
+                            _ws_clients.discard(c)
+            if start - last_ping >= WS_PING_SECONDS:
+                last_ping = start
+                for c in clients:
+                    c.send(b"", 0x9)     # ping; a dead peer fails the write
+        time.sleep(max(0.0, period - (time.monotonic() - start)))
+
+
 class _Handler(BaseHTTPRequestHandler):
     app = None
     gui = None
     server_version = "OpenManipulatorX-Web"
+    # BaseHTTPRequestHandler defaults to HTTP/1.0, and a browser will refuse a
+    # websocket upgrade that comes back as 1.0 - which is exactly how this
+    # first failed: a raw socket client accepted the 101 and Chrome did not.
+    # Safe to raise because every response path here sets Content-Length
+    # (_send and _serve_static_file are the only two), and it lets the polling
+    # client reuse one connection instead of reconnecting several times a
+    # second.
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):
         pass    # a polling phone would otherwise flood the console
@@ -461,11 +619,97 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _ws_handshake(self):
+        """Completes the RFC 6455 upgrade and serves this socket until it
+        closes. Runs on the connection's own thread, courtesy of
+        ThreadingHTTPServer, so a long-lived socket costs one thread and
+        blocks nothing else."""
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self._send(400, json.dumps({"error": "bad websocket handshake"}))
+            return
+        accept = base64.b64encode(
+            hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        try:
+            self.wfile.flush()
+        except OSError:
+            return
+
+        client = _WSClient(self)
+        with _ws_lock:
+            _ws_clients.add(client)
+        # Send one snapshot immediately so the panel paints without waiting
+        # for the next broadcast tick.
+        with self.app.web_state_lock:
+            snapshot = self.app.web_state
+        try:
+            client.send(json.dumps({"t": "state", "s": snapshot}).encode())
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            while client.alive and not self.app.stop_event.is_set():
+                opcode, payload = _ws_read_frame(self.rfile)
+                if opcode is None or opcode == 0x8:      # closed
+                    break
+                if opcode == 0x9:                        # ping -> pong
+                    client.send(payload, 0xA)
+                    continue
+                if opcode != 0x1:                        # only text carries commands
+                    continue
+                try:
+                    msg = json.loads(payload.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                self._ws_handle(client, msg)
+        except (OSError, ValueError):
+            pass
+        finally:
+            with _ws_lock:
+                _ws_clients.discard(client)
+            client.close()
+            # The socket was hijacked for the websocket; there is no next
+            # request on it, so stop the keep-alive loop from waiting for one.
+            self.close_connection = True
+
+    def _ws_handle(self, client, msg):
+        """One decoded client message. Commands go through the SAME perform()
+        the HTTP API uses, so a control can never behave differently depending
+        on which transport it arrived over."""
+        kind = msg.get("t")
+        if kind == "ping":
+            client.send(json.dumps({"t": "pong", "seq": msg.get("seq")}).encode())
+            return
+        if kind != "cmd":
+            return
+        action = str(msg.get("action", ""))
+        body = msg.get("body") or {}
+        try:
+            result = perform(self.app, self.gui, action, body)
+        except Exception as exc:      # noqa: BLE001 - mirror do_POST's guard
+            result = {"ok": False, "error": str(exc)}
+        # Echo the sequence number back so the client can measure round-trip
+        # latency and tell "still catching up" from "idle".
+        if msg.get("seq") is not None:
+            payload = {"t": "ack", "seq": msg["seq"]}
+            if isinstance(result, dict) and result.get("ok") is False:
+                payload["error"] = result.get("error")
+            client.send(json.dumps(payload).encode())
+
     def do_GET(self):
         if not self._authorised():
             self._deny()
             return
         path = self.path.split("?", 1)[0]
+        if (path == "/ws"
+                and (self.headers.get("Upgrade") or "").lower() == "websocket"):
+            self._ws_handshake()
+            return
         if path == "/":
             # Landing page: pick a role. Deliberately unauthenticated - it is
             # a menu, and the guest half is meant to be reachable without a
@@ -534,6 +778,9 @@ def start(app, gui_module, port=WEB_PORT, bind=WEB_BIND):
 
     _Handler.app = app
     _Handler.gui = gui_module
+
+    threading.Thread(target=ws_broadcast_loop, args=(app,),
+                     daemon=True, name="ws-broadcast").start()
 
     def publish():
         """Rebuild the snapshot on the Tk thread and expire stale jog keys."""
@@ -642,6 +889,24 @@ main{padding:14px}
 .status{font-size:12px;color:var(--muted);line-height:1.5;margin-top:10px;
   padding-top:10px;border-top:1px solid var(--line);word-wrap:break-word}
 
+
+/* ---- sliders ---- */
+.jrow{margin-bottom:16px}
+.jhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}
+.jname{font-size:13px;font-weight:600}
+.jname span{color:var(--dim);font-weight:500}
+.jval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--txt)}
+/* Full tap-target height: the visible track stays slim, the grabbable strip
+   around it is what gets to 44px so a thumb can actually catch it. */
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:44px;
+  background:transparent;margin:0}
+input[type=range]::-webkit-slider-runnable-track{height:8px;border-radius:99px;background:var(--card-2);border:1px solid var(--line)}
+input[type=range]::-moz-range-track{height:8px;border-radius:99px;background:var(--card-2);border:1px solid var(--line)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:26px;
+  border-radius:50%;background:var(--txt);border:3px solid var(--red);margin-top:-9px}
+input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;
+  background:var(--txt);border:3px solid var(--red)}
+input[type=range]:disabled{opacity:.4}
 
 /* ---- buttons ---- */
 button{font-family:inherit}
@@ -829,8 +1094,9 @@ PAGE_BODY = """
       <div class="status" id="s-viewer3d"></div>
     </div>
     <div class="card" data-ctl>
-      <h2>Home</h2>
-      <p class="hint">Per-joint sliders were removed from this page - a continuous drag is a bad fit for a link that can lag, and a bigger control surface than a public panel needs. Use Jog for step-wise per-joint moves, Inverse Kinematics for a target position, or teach a Pick &amp; Place under Teach.</p>
+      <h2>Joint Control</h2>
+      <p class="hint">Drag to set each joint target. The twin always follows; the real arm follows too once torque is on. Sent over a realtime socket, which drops intermediate positions rather than queueing them &mdash; so a slow link costs you resolution, never a delayed replay.</p>
+      <div id="joints"></div>
       <button class="btn" id="home">Home Position</button>
       <div class="status" id="s-home"></div>
     </div>
@@ -998,6 +1264,7 @@ PAGE_BODY = """
 
 PAGE_JS = """
 const $ = id => document.getElementById(id);
+let dragging = null;      // joint index currently under the finger
 
 /* Role, injected per-request by the server (/view vs /control). Applied as a
    body class so a stylesheet does the hiding; no element is removed, so every
@@ -1024,6 +1291,80 @@ const POLL_MS  = 200;
 const REQ_TIMEOUT_MS = 4000;
 
 function linkStale(){ return Date.now() - lastOk > STALE_MS; }
+
+/* ---------- realtime socket ----------
+   Controllers get a websocket; guests stay on polling, since they have no
+   commands to send and no latency to care about. If the socket will not open
+   or drops, everything falls back to the HTTP path automatically - the panel
+   must not become unusable because a proxy somewhere refuses upgrades.
+
+   BACKPRESSURE is the whole point. bufferedAmount is the bytes written to the
+   socket that have not yet gone out. On a healthy link it sits at 0; on a
+   congested one it climbs. Checking it before sending is a direct measurement
+   of "am I outrunning the link", which HTTP could not give us - and it is why
+   the joint sliders are safe to have back. Over the limit we DROP the update
+   rather than queue it: the operator cares where the slider is now, never
+   where it passed through, so the newest value simply replaces the last one
+   we failed to send. */
+const WS_MAX_BUFFERED = 8192;
+let ws = null, wsReady = false, wsSeq = 0, wsRtt = null;
+let wsRetry = 800;
+
+function wsConnect(){
+  if(GUEST) return;                       // guests have nothing to send
+  let url;
+  try{
+    url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+    ws = new WebSocket(url);
+  }catch(e){ return; }
+
+  ws.onopen = ()=>{ wsReady = true; wsRetry = 800; };
+
+  ws.onmessage = ev=>{
+    let m; try{ m = JSON.parse(ev.data); }catch(e){ return; }
+    if(m.t === 'state' && m.s && !m.s.error){ render(m.s); lastOk = Date.now(); }
+    else if(m.t === 'ack'){
+      if(m.error) toast(m.error);
+      if(m.seq === wsSeq) wsRtt = Date.now() - wsSentAt;
+    }
+  };
+
+  const bye = ()=>{
+    wsReady = false; ws = null;
+    // Back off, but stay bounded: a controller who walks out of wifi range
+    // should reconnect promptly on return, not after a long exponential wait.
+    setTimeout(wsConnect, wsRetry);
+    wsRetry = Math.min(wsRetry * 2, 5000);
+  };
+  ws.onclose = bye;
+  ws.onerror = ()=>{ try{ ws.close(); }catch(e){} };
+}
+
+let wsSentAt = 0;
+function wsSend(action, body){
+  if(!wsReady || !ws || ws.readyState !== 1) return false;
+  // Congested: drop this update instead of adding to the queue.
+  if(ws.bufferedAmount > WS_MAX_BUFFERED) return false;
+  wsSeq++;
+  wsSentAt = Date.now();
+  try{
+    ws.send(JSON.stringify({t:'cmd', action:action, body:body||{}, seq:wsSeq}));
+    return true;
+  }catch(e){ return false; }
+}
+
+/* Joint targets: socket if we have one, otherwise nothing. Deliberately NOT
+   falling back to POST here - an HTTP fallback for a continuous drag is
+   exactly the queueing behaviour this replaced. Discrete buttons still use
+   post(); only the continuous stream is socket-only. */
+function sendJoint(idx, value){
+  if(!wsSend('joint', {idx:idx, value:value})){
+    // Nothing sent: either no socket or the link is congested. The next
+    // 'input' event carries a newer value, so simply skipping is correct.
+    return false;
+  }
+  return true;
+}
 
 async function post(action, body){
   /* Refuse to queue commands at a robot we are not currently talking to.
@@ -1213,6 +1554,44 @@ function render(s){
     + (f.calibrating ? pill('CALIBRATING', 'warn') : '')
     + (f.cartesian ? pill('CARTESIAN', '') : '');
 
+  /* joints - built once, then value-synced every frame */
+  const box = $('joints');
+  if(box && box.children.length !== s.joints.length){
+    box.innerHTML = s.joints.map(j =>
+      '<div class="jrow"><div class="jhead">' +
+        '<div class="jname">'+j.label.replace(/ - /,' <span>')+'</span></div>' +
+        '<div class="jval" id="jv'+j.idx+'"></div></div>' +
+        '<input type="range" id="js'+j.idx+'" min="'+j.lo+'" max="'+j.hi+
+        '" step="0.001"></div>').join('');
+    s.joints.forEach(j=>{
+      const sl = $('js'+j.idx);
+      sl.addEventListener('pointerdown', ()=>dragging = j.idx);
+      ['pointerup','pointercancel'].forEach(e=>sl.addEventListener(e, ()=>{
+        if(dragging===j.idx) dragging = null;
+        // Always land the exact final value, even if the last few 'input'
+        // events were dropped for congestion.
+        sendJoint(j.idx, +sl.value);
+      }));
+      sl.addEventListener('input', ()=>{
+        $('jv'+j.idx).textContent = (+sl.value).toFixed(3);
+        sendJoint(j.idx, +sl.value);
+      });
+    });
+  }
+  if(box){
+    s.joints.forEach(j=>{
+      const sl = $('js'+j.idx);
+      if(!sl) return;
+      // Never fight the finger: skip the joint being dragged right now.
+      if(dragging === j.idx) return;
+      if(+sl.min !== j.lo) sl.min = j.lo;
+      if(+sl.max !== j.hi) sl.max = j.hi;
+      sl.value = j.value;
+      const lab = $('jv'+j.idx);
+      if(lab) lab.textContent = j.value.toFixed(3);
+    });
+  }
+
 
   /* jog */
   buildPads(f.cartesian);
@@ -1354,6 +1733,7 @@ document.addEventListener('visibilitychange', ()=>{
 });
 
 tick();
+wsConnect();
 """
 
 # Deliberately a SEPARATE <script> tag from PAGE_JS. If anything in here throws

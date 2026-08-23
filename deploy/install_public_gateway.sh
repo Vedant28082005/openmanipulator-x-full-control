@@ -100,6 +100,28 @@ server {
         include /etc/nginx/omx-proxy.conf;
     }
 
+    # The realtime socket. MUST be gated: a websocket upgrade is a GET, so
+    # without this it would fall through to the guest-readable catch-all below
+    # and hand an unauthenticated visitor a full command channel - every
+    # control the panel has, over a transport that never touches /api/.
+    location = /ws {
+        auth_basic           "OpenManipulator-X control";
+        auth_basic_user_file $HTPASSWD;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host       \$host;
+        proxy_set_header X-Real-IP  \$remote_addr;
+        proxy_set_header Cookie "omx_token=$TOKEN";
+        # A control socket is idle whenever the operator is not touching
+        # anything, so it must not be reaped for quietness. The app pings
+        # every 15s, well inside this.
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+        proxy_buffering     off;
+    }
+
     # The controller panel itself is gated too, so signing in happens at the
     # door rather than on the first button press.
     location = /control {
